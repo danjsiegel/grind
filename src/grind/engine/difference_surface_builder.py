@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
+from fnmatch import fnmatch
 from hashlib import sha256
 from io import BytesIO
 import tarfile
@@ -39,10 +41,15 @@ def build_difference_surface(
     open_findings: list[Finding],
     baseline_snapshot_path: Path | None,
     stop_on_failure: bool,
+    scope_excludes: Sequence[str] = (),
 ) -> DifferenceSurfaceBuildResult:
     reported_touched_files = [str(path) for path in observed_delta.get("reported_touched_files", [])]
-    current_snapshot = _snapshot_workspace(cwd)
-    baseline_snapshot = _snapshot_tarball(baseline_snapshot_path) if baseline_snapshot_path else {}
+    current_snapshot = _snapshot_workspace(cwd, scope_excludes=scope_excludes)
+    baseline_snapshot = (
+        _snapshot_tarball(baseline_snapshot_path, scope_excludes=scope_excludes)
+        if baseline_snapshot_path
+        else {}
+    )
 
     added_files = sorted(path for path in current_snapshot if path not in baseline_snapshot)
     removed_files = sorted(path for path in baseline_snapshot if path not in current_snapshot)
@@ -51,7 +58,7 @@ def build_difference_surface(
         for path, digest in current_snapshot.items()
         if path in baseline_snapshot and baseline_snapshot[path] != digest
     )
-    git_touched_files = _git_touched_files(cwd)
+    git_touched_files = _git_touched_files(cwd, scope_excludes=scope_excludes)
     authoritative_touched_files = sorted(set(added_files + modified_files + removed_files + git_touched_files))
 
     existing_reported_files = sorted(path for path in reported_touched_files if path in current_snapshot)
@@ -165,26 +172,26 @@ def _surface_id(run_id: str, iteration: int) -> str:
     return f"surface_{run_id}_{iteration}"
 
 
-def _snapshot_workspace(cwd: Path) -> dict[str, str]:
+def _snapshot_workspace(cwd: Path, *, scope_excludes: Sequence[str] = ()) -> dict[str, str]:
     snapshot: dict[str, str] = {}
     for path in sorted(cwd.rglob("*")):
         if not path.is_file():
             continue
         relative_path = path.relative_to(cwd)
-        if _is_excluded(relative_path):
+        if _is_excluded(relative_path, scope_excludes=scope_excludes):
             continue
         snapshot[str(relative_path)] = _digest_bytes(path.read_bytes())
     return snapshot
 
 
-def _snapshot_tarball(snapshot_path: Path) -> dict[str, str]:
+def _snapshot_tarball(snapshot_path: Path, *, scope_excludes: Sequence[str] = ()) -> dict[str, str]:
     snapshot: dict[str, str] = {}
     with tarfile.open(snapshot_path, mode="r:gz") as archive:
         for member in archive.getmembers():
             if not member.isfile():
                 continue
             member_path = Path(member.name)
-            if _is_excluded(member_path):
+            if _is_excluded(member_path, scope_excludes=scope_excludes):
                 continue
             extracted = archive.extractfile(member)
             if extracted is None:
@@ -193,7 +200,7 @@ def _snapshot_tarball(snapshot_path: Path) -> dict[str, str]:
     return snapshot
 
 
-def _git_touched_files(cwd: Path) -> list[str]:
+def _git_touched_files(cwd: Path, *, scope_excludes: Sequence[str] = ()) -> list[str]:
     completed = subprocess.run(
         ["git", "status", "--short", "--untracked-files=all"],
         cwd=str(cwd),
@@ -211,7 +218,7 @@ def _git_touched_files(cwd: Path) -> list[str]:
         if not candidate:
             continue
         path = Path(candidate)
-        if _is_excluded(path):
+        if _is_excluded(path, scope_excludes=scope_excludes):
             continue
         touched_files.append(candidate)
     return sorted(set(touched_files))
@@ -221,5 +228,19 @@ def _digest_bytes(payload: bytes) -> str:
     return sha256(payload).hexdigest()
 
 
-def _is_excluded(relative_path: Path) -> bool:
-    return any(part in EXCLUDED_PATHS for part in relative_path.parts)
+def _is_excluded(relative_path: Path, *, scope_excludes: Sequence[str] = ()) -> bool:
+    if any(part in EXCLUDED_PATHS for part in relative_path.parts):
+        return True
+
+    path_text = relative_path.as_posix()
+    return any(_matches_scope_rule(path_text, pattern) for pattern in scope_excludes)
+
+
+def _matches_scope_rule(path_text: str, pattern: str) -> bool:
+    normalized = pattern.strip().replace("\\", "/")
+    if not normalized:
+        return False
+    if any(char in normalized for char in "*?["):
+        return fnmatch(path_text, normalized)
+    prefix = normalized.rstrip("/")
+    return path_text == prefix or path_text.startswith(f"{prefix}/")

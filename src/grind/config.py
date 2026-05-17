@@ -10,6 +10,10 @@ import yaml
 from pydantic import BaseModel, Field
 
 
+DEFAULT_GITHUB_MODEL = "claude-sonnet-4.6"
+DEFAULT_KILO_MODEL = "kilo/anthropic/claude-sonnet-4.6"
+
+
 class StateConfig(BaseModel):
   kind: Literal["duckdb"] = "duckdb"
   path: str = ".grind/state/grind.duckdb"
@@ -72,20 +76,20 @@ class ModelProfileConfig(BaseModel):
 
 def default_model_profiles() -> dict[str, ModelProfileConfig]:
     return {
-        "planner": ModelProfileConfig(provider="github_cli", model="claude-sonnet-4.6"),
+    "planner": ModelProfileConfig(provider="github_cli", model=DEFAULT_GITHUB_MODEL),
         "implementer": ModelProfileConfig(
             provider="kilo_cli",
-            model="qwen-3.6-plus",
+      model=DEFAULT_KILO_MODEL,
             agent="code",
             variant="thinking",
         ),
         "checker": ModelProfileConfig(
             provider="kilo_cli",
-            model="qwen-3.6-plus",
+      model=DEFAULT_KILO_MODEL,
             agent="ask",
             variant="instant",
         ),
-        "adjudicator": ModelProfileConfig(provider="github_cli", model="claude-sonnet-4.6"),
+    "adjudicator": ModelProfileConfig(provider="github_cli", model=DEFAULT_GITHUB_MODEL),
     }
 
 
@@ -208,24 +212,27 @@ def render_default_engine_config() -> str:
         models:
           planner:
             provider: github_cli
-            model: claude-sonnet-4.6
+            model: {github_model}
 
           implementer:
             provider: kilo_cli
-            model: qwen-3.6-plus
+            model: {kilo_model}
             agent: code
             variant: thinking
 
           checker:
             provider: kilo_cli
-            model: qwen-3.6-plus
+            model: {kilo_model}
             agent: ask
             variant: instant
 
           adjudicator:
             provider: github_cli
-            model: claude-sonnet-4.6
+            model: {github_model}
         """
+    ).format(
+        github_model=DEFAULT_GITHUB_MODEL,
+        kilo_model=DEFAULT_KILO_MODEL,
     )
 
 

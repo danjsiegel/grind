@@ -1,0 +1,19 @@
+{
+  "backend": "kilo_cli",
+  "probe_id": "kilo_cli.json_smoke",
+  "command": [
+    "kilo",
+    "run",
+    "--auto",
+    "--format",
+    "json",
+    "--model",
+    "kilo/anthropic/claude-sonnet-4.6",
+    "--agent",
+    "ask",
+    "Reply with exactly OK"
+  ],
+  "stdout": "{\"type\":\"step_start\",\"timestamp\":1779025750870,\"sessionID\":\"ses_1c9cd5dc5ffe2IVGhoVqlabBQz\",\"part\":{\"id\":\"prt_e3632ab51001KTaBIhWQ1r6FUH\",\"messageID\":\"msg_e3632a428001rlf5BMluhVR2EE\",\"sessionID\":\"ses_1c9cd5dc5ffe2IVGhoVqlabBQz\",\"snapshot\":\"8da0882aac6204b450ba2c4fa55e660569087a3c\",\"type\":\"step-start\"}}\n{\"type\":\"text\",\"timestamp\":1779025750886,\"sessionID\":\"ses_1c9cd5dc5ffe2IVGhoVqlabBQz\",\"part\":{\"id\":\"prt_e3632ab54001s2laZcYb7UEgvB\",\"messageID\":\"msg_e3632a428001rlf5BMluhVR2EE\",\"sessionID\":\"ses_1c9cd5dc5ffe2IVGhoVqlabBQz\",\"type\":\"text\",\"text\":\"OK\",\"time\":{\"start\":1779025750868,\"end\":1779025750885}}}\n{\"type\":\"step_finish\",\"timestamp\":1779025750964,\"sessionID\":\"ses_1c9cd5dc5ffe2IVGhoVqlabBQz\",\"part\":{\"id\":\"prt_e3632ab83001JieqG0pEVIjuYy\",\"reason\":\"stop\",\"snapshot\":\"8da0882aac6204b450ba2c4fa55e660569087a3c\",\"messageID\":\"msg_e3632a428001rlf5BMluhVR2EE\",\"sessionID\":\"ses_1c9cd5dc5ffe2IVGhoVqlabBQz\",\"type\":\"step-finish\",\"tokens\":{\"total\":6997,\"input\":3,\"output\":4,\"reasoning\":0,\"cache\":{\"write\":6990,\"read\":0}},\"cost\":0.0262815}}\n",
+  "stderr": "",
+  "error": false
+}

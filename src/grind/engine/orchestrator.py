@@ -1928,6 +1928,7 @@ class MinimalOrchestrator:
         )
         store.stages.create(stage)
         open_findings = store.findings.list_by_run(run.run_id)
+        policy_pack = self._policy_pack_for_run(run)
         surface_result = build_difference_surface(
             cwd=self.cwd,
             run=run,
@@ -1938,6 +1939,7 @@ class MinimalOrchestrator:
             open_findings=open_findings,
             baseline_snapshot_path=self._resolve_baseline_snapshot_path(store, run.run_id),
             stop_on_failure=self.config.validation.stop_on_failure,
+            scope_excludes=policy_pack.scope_rules.exclude if policy_pack is not None else (),
         )
         advisory_findings = [
             SemanticAuditFindingPayload(

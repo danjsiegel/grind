@@ -10,7 +10,7 @@ class SkippedProbe:
     probe_id = "github_cli.optional_probe"
     backend = "github_cli"
     kind = ProbeKind.OUTPUT
-    required_by_default = False
+    required_by_default = True
 
     def applies(self, request: VerificationRequest) -> bool:
         return False
@@ -61,3 +61,32 @@ def test_strict_mode_upgrades_skipped_probe_to_failed() -> None:
     assert report.overall_status.value == "failed"
     assert report.probes[0].status == ProbeStatus.FAILED
     assert report.probes[0].status_reason.startswith("strict mode:")
+
+
+class OptionalSkippedProbe:
+    probe_id = "kilo_cli.optional_probe"
+    backend = "kilo_cli"
+    kind = ProbeKind.IDENTITY
+    required_by_default = False
+
+    def applies(self, request: VerificationRequest) -> bool:
+        return False
+
+    def execute(self, request: VerificationRequest):  # pragma: no cover
+        raise AssertionError("skipped probe should not execute")
+
+
+def test_strict_mode_keeps_optional_skipped_probe_non_blocking() -> None:
+    verifier = DefaultBackendVerifier()
+    verifier.probes_for = lambda backend: [OptionalSkippedProbe()]  # type: ignore[method-assign]
+
+    report = verifier.verify(
+        VerificationRequest(
+            backend="kilo_cli",
+            model="kilo/openai/test-model",
+            strict=True,
+        )
+    )
+
+    assert report.overall_status.value == "passed"
+    assert report.probes[0].status == ProbeStatus.SKIPPED

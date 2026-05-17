@@ -2,7 +2,13 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from grind.config import default_engine_config_path, init_engine_workspace, load_engine_config
+from grind.config import (
+    DEFAULT_GITHUB_MODEL,
+    DEFAULT_KILO_MODEL,
+    default_engine_config_path,
+    init_engine_workspace,
+    load_engine_config,
+)
 
 
 def test_default_engine_config_path_uses_repo_root(tmp_path: Path) -> None:
@@ -34,7 +40,10 @@ def test_load_engine_config_reads_model_profiles(tmp_path: Path) -> None:
     assert config.retrieval.workspace_docs_globs == ["README.md", "docs/**/*.md"]
     assert config.retrieval.workspace_spec_globs == [".local/specs/**/*.md"]
     assert config.models["planner"].provider == "github_cli"
+    assert config.models["planner"].model == DEFAULT_GITHUB_MODEL
+    assert config.models["implementer"].model == DEFAULT_KILO_MODEL
     assert config.models["implementer"].variant == "thinking"
+    assert config.models["checker"].model == DEFAULT_KILO_MODEL
     assert config.models["checker"].agent == "ask"
 
 

@@ -68,6 +68,16 @@ those exact IDs exist in your install.
 uv sync --extra dev
 ```
 
+If you are running `grind` from this source checkout against some other repository,
+invoke it from here and point it at the target repo with `--cwd /path/to/target-repo`.
+That target repo gets the `.grind/` directory, state DB, artifacts, and policy pack.
+
+```bash
+uv run --project /path/to/grind grind init --cwd /path/to/target-repo
+uv run --project /path/to/grind grind verify-backend --cwd /path/to/target-repo --backend github_cli --role planner
+uv run --project /path/to/grind grind run --cwd /path/to/target-repo "your objective here"
+```
+
 Optional, for remote DuckDB transport experiments over Quack (preview; current upstream docs use `core_nightly`):
 
 ```bash
@@ -79,33 +89,36 @@ uv run python -c "import duckdb; conn=duckdb.connect(); conn.execute('INSTALL qu
 ## Quick start
 
 ```bash
-# 1. scaffold config + local storage directories + DuckDB schema
-grind init
+# 1. choose the repo you want Grind to operate on
+TARGET_REPO=/path/to/target-repo
 
-# 2. edit .grind/engine.yaml for your actual providers/models/agents
+# 2. scaffold config + local storage directories + DuckDB schema in that repo
+grind init --cwd "$TARGET_REPO"
 
-# 3. verify backend readiness
-grind verify-backend --backend github_cli --role planner
-grind verify-backend --backend kilo_cli --role checker
+# 3. edit $TARGET_REPO/.grind/engine.yaml for your actual providers/models/agents
 
-# 4. create a stored run from an inline objective
-grind run "Build the persistence layer and stop at plan review"
+# 4. verify backend readiness for that repo config
+grind verify-backend --cwd "$TARGET_REPO" --backend github_cli --role planner
+grind verify-backend --cwd "$TARGET_REPO" --backend kilo_cli --role checker
 
-# 5. or create a stored run from a handoff/spec file
-grind run --objective-file /path/to/V1_1_HANDOFF.md
+# 5. create a stored run from an inline objective
+grind run --cwd "$TARGET_REPO" "Build the persistence layer and stop at plan review"
 
-# 6. inspect the stored ledger
-grind status
-grind findings
+# 6. or create a stored run from a handoff/spec file
+grind run --cwd "$TARGET_REPO" --objective-file /path/to/V1_1_HANDOFF.md
 
-# 7. continue from operator hold
-grind resume <run_id>
+# 7. inspect the stored ledger in the target repo
+grind status --cwd "$TARGET_REPO"
+grind findings --cwd "$TARGET_REPO"
 
-# 8. restore the baseline workspace snapshot if needed
-grind restore-checkpoint <run_id>
+# 8. continue from operator hold
+grind resume --cwd "$TARGET_REPO" <run_id>
+
+# 9. restore the baseline workspace snapshot if needed
+grind restore-checkpoint --cwd "$TARGET_REPO" <run_id>
 ```
 
-Running `grind init` creates:
+Running `grind init --cwd "$TARGET_REPO"` creates these paths inside the target repo:
 
 - `.grind/engine.yaml`
 - `.grind/policy/project.yaml`
@@ -117,10 +130,14 @@ Running `grind init` creates:
 
 ## Configuration
 
-`grind init` writes `.grind/engine.yaml`. This file is also used by
-`grind verify-backend --role <role>` when you omit `--model`.
+`grind init --cwd /path/to/target-repo` writes `/path/to/target-repo/.grind/engine.yaml`.
+That file is also used by `grind verify-backend --cwd /path/to/target-repo --role <role>`
+when you omit `--model`.
 
-If `.grind/engine.yaml` is missing, `grind run` and related commands fall back to built-in defaults. `grind init` is still the recommended path because it scaffolds an editable engine config and the default policy pack.
+If the target repo does not have `.grind/engine.yaml`, `grind run` and related commands
+fall back to built-in defaults for that target repo. `grind init --cwd ...` is still the
+recommended path because it scaffolds an editable engine config and the default policy pack
+where the target repo will actually store its run state.
 
 ```yaml
 # .grind/engine.yaml
@@ -148,13 +165,13 @@ models:
 
   implementer:
     provider: kilo_cli
-    model: qwen-3.6-plus
+    model: kilo/anthropic/claude-sonnet-4.6
     agent: code
     variant: thinking
 
   checker:
     provider: kilo_cli
-    model: qwen-3.6-plus
+    model: kilo/anthropic/claude-sonnet-4.6
     agent: ask
     variant: instant
 
@@ -195,12 +212,13 @@ Initialize the local engine workspace.
 
 ```bash
 grind init
-grind init --cwd /path/to/repo
+grind init --cwd /path/to/target-repo
 grind init --force
 ```
 
-This creates the config file, storage directories, and applies the DuckDB schema
-migrations.
+Use `--cwd` when Grind is operating on a repo other than the one you launched the
+command from. This creates the config file, storage directories, and applies the
+DuckDB schema migrations in the target repo.
 
 ### `grind verify-backend`
 
@@ -212,18 +230,18 @@ execution.
 grind verify-backend
 
 # verify one backend explicitly
-grind verify-backend --backend github_cli
-grind verify-backend --backend kilo_cli
+grind verify-backend --cwd /path/to/target-repo --backend github_cli
+grind verify-backend --cwd /path/to/target-repo --backend kilo_cli
 
 # verify a real GitHub CLI model
-grind verify-backend --backend github_cli --model claude-sonnet-4.6
+grind verify-backend --cwd /path/to/target-repo --backend github_cli --model claude-sonnet-4.6
 
 # verify a Kilo model/agent combination
-grind verify-backend --backend kilo_cli --model qwen-3.6-plus --agent code --variant thinking
+grind verify-backend --cwd /path/to/target-repo --backend kilo_cli --model kilo/anthropic/claude-sonnet-4.6 --agent code --variant thinking
 
 # resolve model settings from .grind/engine.yaml
-grind verify-backend --backend github_cli --role planner
-grind verify-backend --backend kilo_cli --role checker
+grind verify-backend --cwd /path/to/target-repo --backend github_cli --role planner
+grind verify-backend --cwd /path/to/target-repo --backend kilo_cli --role checker
 
 # fail if skipped probes would otherwise be treated as not-applicable
 grind verify-backend --strict
@@ -241,13 +259,13 @@ Create a real stored run in DuckDB.
 
 ```bash
 # inline objective
-grind run "Run the Kepler handoff benchmark"
+grind run --cwd /path/to/target-repo "Run the Kepler handoff benchmark"
 
 # objective from file
-grind run --objective-file /path/to/V1_1_HANDOFF.md
+grind run --cwd /path/to/target-repo --objective-file /path/to/V1_1_HANDOFF.md
 
 # machine-readable output
-grind run --objective-file /path/to/V1_1_HANDOFF.md --json
+grind run --cwd /path/to/target-repo --objective-file /path/to/V1_1_HANDOFF.md --json
 ```
 
 Current behavior of `grind run`:
@@ -266,16 +284,16 @@ Resume a held run after operator review.
 
 ```bash
 # continue the latest held run path
-grind resume <run_id>
+grind resume --cwd /path/to/target-repo <run_id>
 
 # restore the selected checkpoint before validation
-grind resume <run_id> --restore-checkpoint
+grind resume --cwd /path/to/target-repo <run_id> --restore-checkpoint
 
 # restore a specific checkpoint before validation
-grind resume <run_id> --restore-checkpoint --checkpoint-id <checkpoint_id>
+grind resume --cwd /path/to/target-repo <run_id> --restore-checkpoint --checkpoint-id <checkpoint_id>
 
 # machine-readable output
-grind resume <run_id> --json
+grind resume --cwd /path/to/target-repo <run_id> --json
 ```
 
 Current behavior of `grind resume`:
@@ -297,9 +315,9 @@ Current behavior of `grind resume`:
 Restore the latest or specified checkpoint artifact into the workspace.
 
 ```bash
-grind restore-checkpoint <run_id>
-grind restore-checkpoint <run_id> --checkpoint-id <checkpoint_id>
-grind restore-checkpoint <run_id> --json
+grind restore-checkpoint --cwd /path/to/target-repo <run_id>
+grind restore-checkpoint --cwd /path/to/target-repo <run_id> --checkpoint-id <checkpoint_id>
+grind restore-checkpoint --cwd /path/to/target-repo <run_id> --json
 ```
 
 ### `grind status`
@@ -307,9 +325,9 @@ grind restore-checkpoint <run_id> --json
 Summarize the latest run or a specific run directly from DuckDB.
 
 ```bash
-grind status
-grind status --run-id <run_id>
-grind status --json
+grind status --cwd /path/to/target-repo
+grind status --cwd /path/to/target-repo --run-id <run_id>
+grind status --cwd /path/to/target-repo --json
 ```
 
 ### `grind findings`
@@ -317,9 +335,9 @@ grind status --json
 List stored findings for the latest run or a specific run.
 
 ```bash
-grind findings
-grind findings --run-id <run_id>
-grind findings --json
+grind findings --cwd /path/to/target-repo
+grind findings --cwd /path/to/target-repo --run-id <run_id>
+grind findings --cwd /path/to/target-repo --json
 ```
 
 ---

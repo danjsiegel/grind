@@ -65,7 +65,7 @@ class DefaultBackendVerifier(BackendVerifier):
                     status_reason="probe not applicable to this request",
                 )
 
-            if resolved_request.strict and result.status == ProbeStatus.SKIPPED:
+            if resolved_request.strict and result.status == ProbeStatus.SKIPPED and result.required:
                 result = result.model_copy(
                     update={
                         "required": True,

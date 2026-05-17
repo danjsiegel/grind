@@ -78,6 +78,44 @@ def test_concurrent_acquisition_raises_lease_conflict(tmp_path: Path) -> None:
             raise AssertionError("expected LeaseConflictError")
 
 
+def test_concurrent_acquisition(tmp_path: Path) -> None:
+    test_concurrent_acquisition_raises_lease_conflict(tmp_path)
+
+
+def test_lease_conflict_hold(tmp_path: Path, monkeypatch) -> None:
+    init_engine_workspace(tmp_path)
+    database_path = tmp_path / ".grind" / "state" / "grind.duckdb"
+
+    monkeypatch.setattr(
+        "grind.engine.orchestrator.invoke_text_prompt",
+        lambda profile, *, prompt, cwd: ModelInvocationResult(
+            command=["fake-planner"],
+            stdout='{"plan":"ship it"}',
+            stderr="",
+            returncode=0,
+        ),
+    )
+
+    worker_a = MinimalOrchestrator(cwd=tmp_path)
+    run_outcome = worker_a.run(objective="lease conflict", source_kind=TaskSourceKind.INLINE)
+
+    with open_state_store(database_path) as store:
+        acquire_lease(store.connection, run_outcome.run_id, worker_a.worker_id)
+
+    worker_b = MinimalOrchestrator(cwd=tmp_path)
+    resume_outcome = worker_b.resume(run_id=run_outcome.run_id)
+
+    assert resume_outcome.final_state == RunState.AWAITING_OPERATOR
+    with open_state_store(database_path) as store:
+        run = store.runs.get(run_outcome.run_id)
+
+    assert run is not None
+    assert run.operator_status == OperatorStatus.HOLD
+    assert run.current_hold_type == HoldType.LEASE_CONFLICT
+    assert worker_a.worker_id in (run.current_hold_reason or "")
+    assert run.current_hold_context == {"worker_id": worker_b.worker_id}
+
+
 def test_expire_stale_leases_requires_missed_heartbeat(tmp_path: Path) -> None:
     database_path = tmp_path / ".grind" / "state" / "grind.duckdb"
     bootstrap_state_store(database_path)
@@ -115,6 +153,37 @@ def test_expire_stale_leases_requires_missed_heartbeat(tmp_path: Path) -> None:
     assert expired_lease.status == "expired"
     assert stale_run_after is not None
     assert stale_run_after.current_worker_id is None
+
+
+def test_acquire_lease_retries_on_writer_conflict(tmp_path: Path, monkeypatch) -> None:
+    database_path = tmp_path / ".grind" / "state" / "grind.duckdb"
+    bootstrap_state_store(database_path)
+
+    with open_state_store(database_path) as store:
+        run = _create_run(store, tmp_path, run_id="run_lease_retry")
+        store.workers.register(Worker(worker_id="worker_retry", hostname="host-a", pid=111))
+
+        attempts = {"count": 0}
+        sleep_calls: list[float] = []
+        original_create = release_lease.__globals__["RunLeaseRepository"].create
+
+        def flaky_create(self, lease):
+            attempts["count"] += 1
+            if attempts["count"] == 1:
+                raise RuntimeError("write-write conflict")
+            return original_create(self, lease)
+
+        monkeypatch.setattr("grind.engine.leases.RunLeaseRepository.create", flaky_create)
+        monkeypatch.setattr("grind.engine.leases.random.uniform", lambda lower, upper: 0.0)
+        monkeypatch.setattr("grind.engine.leases.time.sleep", lambda seconds: sleep_calls.append(seconds))
+
+        lease = acquire_lease(store.connection, run.run_id, "worker_retry")
+        active_lease = store.run_leases.get_active_by_run(run.run_id)
+
+    assert attempts["count"] == 2
+    assert sleep_calls == [0.0]
+    assert active_lease is not None
+    assert active_lease.lease_id == lease.lease_id
 
 
 def test_release_allows_worker_handoff(tmp_path: Path) -> None:

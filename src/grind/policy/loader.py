@@ -13,8 +13,22 @@ class PolicySchemaError(ValueError):
 
 
 class PolicyLoader:
-    @classmethod
-    def load(cls, policy_pack_path: Path) -> PolicyPack:
+    def __init__(self, policy_pack_path: Path | str | None = None):
+        self._policy_pack_path = Path(policy_pack_path) if policy_pack_path is not None else None
+
+    def load(self, policy_pack_path: Path | str | None = None) -> PolicyPack:
+        if isinstance(self, PolicyLoader):
+            resolved_path = policy_pack_path or self._policy_pack_path
+        else:
+            resolved_path = self if policy_pack_path is None else policy_pack_path
+
+        if resolved_path is None:
+            raise TypeError("policy_pack_path is required")
+
+        return PolicyLoader._load_from_path(Path(resolved_path))
+
+    @staticmethod
+    def _load_from_path(policy_pack_path: Path) -> PolicyPack:
         path = policy_pack_path / "project.yaml" if policy_pack_path.is_dir() else policy_pack_path
         if not path.exists():
             raise FileNotFoundError(f"policy pack not found: {path}")

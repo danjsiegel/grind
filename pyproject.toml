@@ -9,7 +9,7 @@ description = "Grind orchestration engine scaffolding"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
-  "duckdb>=1.2,<2",
+  "duckdb>=1.5.2,<2",
   "lancedb>=0.6,<1",
   "pydantic>=2.11,<3",
   "pytz>=2024,<2026",
