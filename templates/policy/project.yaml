@@ -1,0 +1,22 @@
+schema_ver: "1"
+
+validation_commands:
+  - command: "uv run pytest tests -q"
+    risk: safe
+    timeout_seconds: 120
+
+safe_paths:
+  - "src/"
+  - "tests/"
+  - "pyproject.toml"
+
+scope_rules:
+  exclude:
+    - ".venv/"
+    - "*.lock"
+    - ".grind/"
+
+forbidden_commands:
+  - "rm -rf"
+  - "git push --force"
+  - "git reset --hard"

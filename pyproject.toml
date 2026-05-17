@@ -1,0 +1,29 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "grind"
+version = "0.1.0"
+description = "Grind orchestration engine scaffolding"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "duckdb>=1.2,<2",
+  "lancedb>=0.6,<1",
+  "pydantic>=2.11,<3",
+  "pytz>=2024,<2026",
+  "PyYAML>=6,<7",
+]
+
+[project.scripts]
+grind = "grind.cli:main"
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.3,<9",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]

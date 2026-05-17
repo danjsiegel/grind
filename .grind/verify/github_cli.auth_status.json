@@ -1,0 +1,14 @@
+{
+  "backend": "github_cli",
+  "probe_id": "github_cli.auth_status",
+  "command": [
+    "gh",
+    "auth",
+    "status",
+    "--json",
+    "hosts"
+  ],
+  "stdout": "{\"hosts\":{\"github.com\":[{\"state\":\"success\",\"active\":true,\"host\":\"github.com\",\"login\":\"danjsiegel\",\"tokenSource\":\"keyring\",\"scopes\":\"gist, read:org, repo, workflow\",\"gitProtocol\":\"https\"}]}}\n",
+  "stderr": "",
+  "error": false
+}
