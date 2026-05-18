@@ -1,32 +1,33 @@
 # grind
 
-`grind` is a plan/do/check/act engine for software change that treats evidence as
-the product, not a nice-to-have. It separates planner, implementer, checker, and
-adjudicator roles, keeps the run ledger in DuckDB, and makes validation, semantic
-audit, findings, and holds part of the workflow instead of cleanup after the fact.
+`grind` is a plan/do/check/act workflow for software change.
 
-If a change cannot survive validation and independent review, Grind does not call
-it done. The goal is fewer hallucinated fixes, fewer unsupported claims, and a
-cleaner path from request to inspectable result.
+I first built this workflow for myself as a shell script. This version rebuilds
+it around DuckDB as the canonical ledger, adds Quack-aware shared state for
+multi-worker setups, and records the work as runs, artifacts, validation output,
+findings, and holds instead of leaving everything in terminal scrollback.
 
-## What this repo is today
+The point is simple: do not trust a single pass. Plan the change, make the
+change, validate what actually happened, and run an independent check before
+calling it done. If a change cannot survive validation and review, Grind does
+not call it done.
 
-Not the entire long-range spec. This repository now implements the v0.1 fleet-core contract of it:
+## What Grind does today
 
-- `grind init` scaffolds `.grind/engine.yaml`, `.grind/policy/project.yaml`, and the local storage layout
-- DuckDB remains the canonical run ledger locally, and the state bootstrap layer is Quack-aware for shared deployments via `GRIND_DB_URI` or `state.db_uri`
-- `grind run` creates a stored run, captures a baseline checkpoint, persists planner artifacts, and records the policy pack used for the run
-- `grind resume` registers workers, acquires run leases, runs shell-free validation with timeout and risky-command holds, persists semantic-audit and evidence-verification artifacts, then drives checker, adjudicator, and acting loops
-- operator commands such as `approve`, `reject`, `abort`, `hold-reason`, `patch-policy`, `inspect`, `report`, `retrieval-index`, and `retrieval-search` are implemented against the stored ledger
+- scaffolds a `.grind/` workspace inside a target repository
+- stores runs, tasks, stages, artifacts, validations, findings, checkpoints,
+  and operator actions in DuckDB
+- runs planner, implementer, checker, and adjudicator steps with resumable holds
+- supports Quack-aware state bootstrapping for shared multi-worker setups
+- keeps validation output and review artifacts instead of treating them as
+  throwaway logs
 
-Still not full-spec or still intentionally narrowed:
+## What it does not do yet
 
 - shared object-store artifact backends such as S3 or GCS
-- OpenTelemetry spans and metrics
-- the broader generic backend/platform surface beyond the shipped first-party runtime integrations
-- some long-horizon spec areas that exist as design targets but are not v0.1 ship gates
-
-So the honest answer is still simple: this is usable, real, and no longer just a local-only prototype, but it is not the full long-term spec.
+- OpenTelemetry tracing and metrics
+- a plugin marketplace or a broad integration surface
+- automatic retention and pruning of ledger data and artifacts
 
 ---
 
