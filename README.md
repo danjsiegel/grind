@@ -197,9 +197,9 @@ Storage fields:
 | `state.kind` | yes | currently `duckdb` |
 | `state.path` | yes | canonical ledger path; default `.grind/state/grind.duckdb` |
 | `artifacts.root` | yes | local artifact root; default `.grind/artifacts` |
-| `retention.mode` | yes | currently `manual`; Grind does not auto-prune ledger data |
-| `retention.export_root` | yes | reserved for future export/prune flows |
-| `retention.keep_artifacts_days` | no | placeholder for future retention policy |
+| `retention.mode` | yes | currently `manual`; Grind does not auto-prune, but `grind prune` can remove old terminal runs and their artifacts |
+| `retention.export_root` | yes | reserved for future archive/export flows |
+| `retention.keep_artifacts_days` | no | placeholder for future policy-driven retention |
 | `validation.commands` | yes | shell commands run by `grind resume` during the validation slice |
 | `validation.stop_on_failure` | yes | stop after the first failing validation command |
 
@@ -365,7 +365,8 @@ The ledger currently stores:
 - operator actions
 
 Retention posture is currently manual. Grind does not auto-delete ledger rows or
-artifact history.
+artifact history, but you can explicitly prune old terminal runs with
+`grind prune --keep-last N`.
 
 ---
 

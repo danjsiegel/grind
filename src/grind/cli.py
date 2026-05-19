@@ -3,18 +3,323 @@ from __future__ import annotations
 import argparse
 from decimal import Decimal
 import json
+import shlex
 import sys
 from pathlib import Path
 
+import shutil
 from grind.config import default_engine_config_path, init_engine_workspace, load_engine_config
 from grind.engine.orchestrator import MinimalOrchestrator
 from grind.models.enums import TaskSourceKind
+from grind.providers import extract_text_output
 from grind.retrieval import LanceDBRetrievalService
-from grind.state import bootstrap_state_store, current_schema_version
+from grind.state import bootstrap_state_store, current_schema_version, open_state_store
 from grind.verification.models import VerificationOverallStatus, VerificationRequest
 from grind.verification.service import DefaultBackendVerifier, VerificationConfigError
 
 
+def _shell_command(parts: list[str]) -> str:
+    return " ".join(shlex.quote(part) for part in parts)
+
+
+def _base_command(command: str, *, cwd: Path | None, config_path: Path | None) -> list[str]:
+    parts = ["grind", command]
+    if cwd is not None:
+        parts.extend(["--cwd", str(cwd)])
+    if config_path is not None:
+        parts.extend(["--config", str(config_path)])
+    return parts
+
+
+def _inspect_command(
+    *,
+    run_id: str,
+    cwd: Path | None,
+    config_path: Path | None,
+    artifact_id: str | None = None,
+) -> str:
+    parts = _base_command("inspect", cwd=cwd, config_path=config_path)
+    if artifact_id is not None:
+        parts.append(artifact_id)
+    parts.extend(["--run-id", run_id])
+    return _shell_command(parts)
+
+
+def _resume_command(*, run_id: str, cwd: Path | None, config_path: Path | None) -> str:
+    parts = _base_command("resume", cwd=cwd, config_path=config_path)
+    parts.append(run_id)
+    return _shell_command(parts)
+
+
+def _approve_command(*, run_id: str, cwd: Path | None, config_path: Path | None) -> str:
+    parts = _base_command("approve", cwd=cwd, config_path=config_path)
+    parts.append(run_id)
+    return _shell_command(parts)
+
+
+def _reject_command(*, run_id: str, cwd: Path | None, config_path: Path | None) -> str:
+    parts = _base_command("reject", cwd=cwd, config_path=config_path)
+    parts.append(run_id)
+    return _shell_command(parts)
+
+
+def _hold_reason_command(*, run_id: str, cwd: Path | None, config_path: Path | None) -> str:
+    parts = _base_command("hold-reason", cwd=cwd, config_path=config_path)
+    parts.append(run_id)
+    return _shell_command(parts)
+
+
+def _resolve_artifact_path(
+    *,
+    database_path: Path,
+    artifacts_root: Path,
+    artifact_id: str,
+    db_uri: str | None,
+) -> str | None:
+    with open_state_store(database_path, db_uri=db_uri) as store:
+        artifact = store.artifacts.get(artifact_id)
+    if artifact is None:
+        return None
+    candidate = Path(artifact.path)
+    if not candidate.is_absolute():
+        candidate = artifacts_root / candidate
+    return str(candidate)
+
+
+def _plan_review_paths(
+    *,
+    database_path: Path,
+    artifacts_root: Path,
+    hold_context: dict[str, object] | None,
+    db_uri: str | None,
+) -> dict[str, str]:
+    context = hold_context if isinstance(hold_context, dict) else {}
+    resolved: dict[str, str] = {}
+    artifact_ids = {
+        "plan": context.get("plan_artifact_id"),
+        "planner_response": context.get("response_artifact_id"),
+    }
+    for label, artifact_id in artifact_ids.items():
+        if not isinstance(artifact_id, str):
+            continue
+        path = _resolve_artifact_path(
+            database_path=database_path,
+            artifacts_root=artifacts_root,
+            artifact_id=artifact_id,
+            db_uri=db_uri,
+        )
+        if path is not None:
+            resolved[label] = path
+    if "plan" in resolved:
+        synthesized = _synthesize_legacy_plan_review(
+            plan_path=Path(resolved["plan"]),
+            planner_response_path=Path(resolved["planner_response"]) if "planner_response" in resolved else None,
+        )
+        if synthesized is not None:
+            resolved["plan"] = str(synthesized)
+    return resolved
+
+
+def _extract_planner_review_text(payload: str) -> str:
+    extracted = extract_text_output(payload)
+    stripped = payload.strip()
+    if extracted.strip() and extracted.strip() != stripped:
+        return extracted.strip()
+
+    if stripped:
+        try:
+            parsed = json.loads(stripped)
+        except json.JSONDecodeError:
+            parsed = None
+
+        if isinstance(parsed, dict):
+            for key in ("plan", "summary", "proposed_plan"):
+                value = parsed.get(key)
+                if isinstance(value, str) and value.strip():
+                    return value.strip()
+                if isinstance(value, list):
+                    parts = [item.strip() for item in value if isinstance(item, str) and item.strip()]
+                    if parts:
+                        return "\n".join(parts)
+
+    return extracted.strip() or stripped
+
+
+def _looks_like_planning_prompt(text: str) -> bool:
+    stripped = text.lstrip()
+    return stripped.startswith("You are planning a grind task.")
+
+
+def _synthesize_legacy_plan_review(*, plan_path: Path, planner_response_path: Path | None) -> Path | None:
+    if plan_path.suffix.lower() != ".json" or not plan_path.exists():
+        return None
+
+    try:
+        payload = json.loads(plan_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+
+    objective = payload.get("objective") if isinstance(payload.get("objective"), str) else "Objective unavailable."
+    response_text = ""
+    if planner_response_path is not None and planner_response_path.exists():
+        try:
+            response_text = _extract_planner_review_text(planner_response_path.read_text(encoding="utf-8"))
+        except OSError:
+            response_text = ""
+
+    if not response_text or _looks_like_planning_prompt(response_text):
+        response_text = "Stored planner output is not a reviewable plan. Reject this hold and replan to generate a proper review brief."
+
+    synthesized_path = plan_path.with_name(f"{plan_path.stem}_review.md")
+    synthesized_path.write_text(
+        "\n".join(
+            [
+                "# Plan Review",
+                "",
+                "This review brief was synthesized from a legacy hold artifact.",
+                "",
+                "## Objective",
+                "",
+                objective.strip(),
+                "",
+                "## Proposed Plan",
+                "",
+                response_text.strip(),
+                "",
+                "## Operator Actions",
+                "",
+                "- Approve only if this plan is specific, scoped, and reviewable.",
+                "- Reject and replan if the stored output is vague or not actually a plan.",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    return synthesized_path
+
+
+def _print_hold_guidance(
+    *,
+    run_id: str,
+    hold_type: str | None,
+    hold_reason: str | None,
+    hold_context: dict[str, object] | None,
+    database_path: Path,
+    artifacts_root: Path,
+    db_uri: str | None,
+    cwd: Path | None,
+    config_path: Path | None,
+) -> None:
+    if hold_type:
+        print(f"hold: {hold_type}")
+    if hold_reason:
+        print(f"reason: {hold_reason}")
+
+    context = hold_context if isinstance(hold_context, dict) else {}
+    if hold_type == "plan_review":
+        review_paths = _plan_review_paths(
+            database_path=database_path,
+            artifacts_root=artifacts_root,
+            hold_context=context,
+            db_uri=db_uri,
+        )
+        if review_paths.get("plan"):
+            print(f"review plan: {review_paths['plan']}")
+        print(f"approve: {_approve_command(run_id=run_id, cwd=cwd, config_path=config_path)}")
+        print(
+            "reject: "
+            + _reject_command(run_id=run_id, cwd=cwd, config_path=config_path)
+            + " --reason 'needs changes'"
+        )
+        print(
+            "resume after approval: "
+            + _resume_command(run_id=run_id, cwd=cwd, config_path=config_path)
+        )
+        return
+
+    if hold_type or hold_reason:
+        print(f"details: {_hold_reason_command(run_id=run_id, cwd=cwd, config_path=config_path)}")
+
+
+def _terminal_run_ids_to_prune(*, database_path: Path, db_uri: str | None, keep_last: int) -> list[str]:
+    with open_state_store(database_path, db_uri=db_uri) as store:
+        rows = store.connection.execute(
+            """
+            SELECT run_id
+            FROM runs
+            WHERE state IN ('completed', 'failed', 'aborted')
+            ORDER BY created_at DESC
+            """
+        ).fetchall()
+    return [row[0] for row in rows[keep_last:]]
+
+
+def _prune_run_records(*, database_path: Path, db_uri: str | None, run_id: str) -> dict[str, int]:
+    with open_state_store(database_path, db_uri=db_uri) as store:
+        artifact_rows = store.artifacts.list_by_run(run_id)
+        artifact_count = len(artifact_rows)
+        artifact_bytes = sum(int(artifact.size_bytes or 0) for artifact in artifact_rows)
+        stage_ids = [row[0] for row in store.connection.execute("SELECT stage_id FROM stages WHERE run_id = ?", [run_id]).fetchall()]
+        task_ids = [row[0] for row in store.connection.execute("SELECT task_id FROM tasks WHERE run_id = ?", [run_id]).fetchall()]
+
+        store.connection.execute("DELETE FROM adjudication_votes WHERE run_id = ?", [run_id])
+        for stage_id in stage_ids:
+            store.connection.execute("DELETE FROM adjudication_votes WHERE stage_id = ?", [stage_id])
+        store.connection.execute(
+            "DELETE FROM dispositions WHERE finding_id IN (SELECT finding_id FROM findings WHERE run_id = ?)",
+            [run_id],
+        )
+        for stage_id in stage_ids:
+            store.connection.execute("DELETE FROM dispositions WHERE stage_id = ?", [stage_id])
+        store.connection.execute(
+            "DELETE FROM finding_evidence WHERE finding_id IN (SELECT finding_id FROM findings WHERE run_id = ?)",
+            [run_id],
+        )
+        store.connection.execute("DELETE FROM validations WHERE run_id = ?", [run_id])
+        for stage_id in stage_ids:
+            store.connection.execute("DELETE FROM validations WHERE stage_id = ?", [stage_id])
+        for task_id in task_ids:
+            store.connection.execute("DELETE FROM validations WHERE task_id = ?", [task_id])
+        store.connection.execute("DELETE FROM model_calls WHERE run_id = ?", [run_id])
+        for stage_id in stage_ids:
+            store.connection.execute("DELETE FROM model_calls WHERE stage_id = ?", [stage_id])
+        store.connection.execute("DELETE FROM semantic_audits WHERE run_id = ?", [run_id])
+        for stage_id in stage_ids:
+            store.connection.execute("DELETE FROM semantic_audits WHERE stage_id = ?", [stage_id])
+        for task_id in task_ids:
+            store.connection.execute("DELETE FROM semantic_audits WHERE task_id = ?", [task_id])
+        store.connection.execute("DELETE FROM adjudication_panels WHERE run_id = ?", [run_id])
+        for stage_id in stage_ids:
+            store.connection.execute("DELETE FROM adjudication_panels WHERE stage_id = ?", [stage_id])
+        for task_id in task_ids:
+            store.connection.execute("DELETE FROM adjudication_panels WHERE task_id = ?", [task_id])
+        store.connection.execute("DELETE FROM retrieval_index_queue WHERE run_id = ?", [run_id])
+        store.connection.execute("DELETE FROM operator_actions WHERE run_id = ?", [run_id])
+        store.connection.execute("DELETE FROM run_leases WHERE run_id = ?", [run_id])
+        store.connection.execute("DELETE FROM transitions WHERE run_id = ?", [run_id])
+        store.connection.execute("DELETE FROM workspace_checkpoints WHERE run_id = ?", [run_id])
+        store.connection.execute("DELETE FROM findings WHERE run_id = ?", [run_id])
+        store.connection.execute("DELETE FROM stages WHERE run_id = ?", [run_id])
+        store.connection.execute("DELETE FROM tasks WHERE run_id = ?", [run_id])
+        store.connection.execute("DELETE FROM artifacts WHERE run_id = ?", [run_id])
+        store.connection.execute("DELETE FROM runs WHERE run_id = ?", [run_id])
+
+    return {
+        "runs_pruned": 1,
+        "artifacts_pruned": artifact_count,
+        "artifact_bytes_pruned": artifact_bytes,
+    }
+
+
+def _delete_run_artifacts(*, artifacts_root: Path, run_id: str) -> None:
+    run_dir = artifacts_root / run_id
+    if run_dir.exists():
+        shutil.rmtree(run_dir)
+
+
+def _vacuum_database(*, database_path: Path, db_uri: str | None) -> None:
+    with open_state_store(database_path, db_uri=db_uri) as store:
+        store.connection.execute("VACUUM")
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="grind")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -125,6 +430,13 @@ def build_parser() -> argparse.ArgumentParser:
     retrieval_search.add_argument("--config", dest="config_path", type=Path)
     retrieval_search.add_argument("--json", action="store_true")
 
+    prune = subparsers.add_parser("prune")
+    prune.add_argument("--keep-last", type=int, required=True)
+    prune.add_argument("--cwd", type=Path)
+    prune.add_argument("--config", dest="config_path", type=Path)
+    prune.add_argument("--dry-run", action="store_true")
+    prune.add_argument("--json", action="store_true")
+
     verify_backend = subparsers.add_parser("verify-backend")
     verify_backend.add_argument(
         "--backend",
@@ -174,15 +486,16 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 0
 
-    if args.command in {"run", "resume", "approve", "reject", "abort", "hold-reason", "patch-policy", "restore-checkpoint", "status", "findings", "inspect", "report", "retrieval-index", "retrieval-search"}:
+    if args.command in {"run", "resume", "approve", "reject", "abort", "hold-reason", "patch-policy", "restore-checkpoint", "status", "findings", "inspect", "report", "retrieval-index", "retrieval-search", "prune"}:
         cwd = args.cwd or Path.cwd()
         config_path = args.config_path or default_engine_config_path(cwd)
+        config = load_engine_config(config_path)
         orchestrator = MinimalOrchestrator(
             cwd=cwd,
             config_path=config_path,
             policy_pack_path=getattr(args, "policy_pack_path", None),
         )
-        retrieval_service = LanceDBRetrievalService(cwd=cwd, config=load_engine_config(config_path))
+        retrieval_service = LanceDBRetrievalService(cwd=cwd, config=config)
 
     if args.command == "run":
         if args.objective and args.objective_file:
@@ -208,19 +521,35 @@ def main(argv: list[str] | None = None) -> int:
             "checkpoint_id": outcome.checkpoint_id,
             "final_state": outcome.final_state.value,
             "operator_status": outcome.operator_status.value,
+            "hold_type": outcome.hold_type,
+            "hold_reason": outcome.hold_reason,
+            "hold_context": outcome.hold_context,
             "database_path": str(outcome.database_path),
             "artifacts_root": str(outcome.artifacts_root),
         }
+        if outcome.hold_type == "plan_review":
+            payload["review_paths"] = _plan_review_paths(
+                database_path=outcome.database_path,
+                artifacts_root=outcome.artifacts_root,
+                hold_context=outcome.hold_context,
+                db_uri=config.state_db_uri(),
+            )
         if args.json:
             print(json.dumps(payload, indent=2))
         else:
             print(f"run_id: {outcome.run_id}")
-            print(f"task_id: {outcome.task_id}")
-            print(f"final_state: {outcome.final_state}")
-            print(f"operator_status: {outcome.operator_status}")
-            print(f"state database: {outcome.database_path}")
-            print(f"artifacts root: {outcome.artifacts_root}")
-            print("note: planner output is stored for operator review; use `grind resume` to continue")
+            print(f"status: {outcome.final_state.value}")
+            _print_hold_guidance(
+                run_id=outcome.run_id,
+                hold_type=outcome.hold_type,
+                hold_reason=outcome.hold_reason,
+                hold_context=outcome.hold_context,
+                database_path=outcome.database_path,
+                artifacts_root=outcome.artifacts_root,
+                db_uri=config.state_db_uri(),
+                cwd=args.cwd,
+                config_path=args.config_path,
+            )
         return 0
 
     if args.command == "resume":
@@ -240,19 +569,85 @@ def main(argv: list[str] | None = None) -> int:
             "validation_stage_id": outcome.validation_stage_id,
             "final_state": outcome.final_state.value,
             "operator_status": outcome.operator_status.value,
+            "hold_type": outcome.hold_type,
+            "hold_reason": outcome.hold_reason,
+            "hold_context": outcome.hold_context,
             "restored_checkpoint_id": outcome.restored_checkpoint_id,
             "database_path": str(outcome.database_path),
             "artifacts_root": str(outcome.artifacts_root),
         }
+        if outcome.hold_type == "plan_review":
+            payload["review_paths"] = _plan_review_paths(
+                database_path=outcome.database_path,
+                artifacts_root=outcome.artifacts_root,
+                hold_context=outcome.hold_context,
+                db_uri=config.state_db_uri(),
+            )
         if args.json:
             print(json.dumps(payload, indent=2))
         else:
             print(f"run_id: {outcome.run_id}")
-            print(f"validation_stage_id: {outcome.validation_stage_id}")
-            print(f"final_state: {outcome.final_state}")
-            print(f"operator_status: {outcome.operator_status}")
+            print(f"status: {outcome.final_state.value}")
             if outcome.restored_checkpoint_id:
                 print(f"restored_checkpoint_id: {outcome.restored_checkpoint_id}")
+            _print_hold_guidance(
+                run_id=outcome.run_id,
+                hold_type=outcome.hold_type,
+                hold_reason=outcome.hold_reason,
+                hold_context=outcome.hold_context,
+                database_path=outcome.database_path,
+                artifacts_root=outcome.artifacts_root,
+                db_uri=config.state_db_uri(),
+                cwd=args.cwd,
+                config_path=args.config_path,
+            )
+        return 0
+
+    if args.command == "prune":
+        if args.keep_last < 0:
+            print("--keep-last must be >= 0", file=sys.stderr)
+            return 2
+
+        run_ids = _terminal_run_ids_to_prune(
+            database_path=config.state_path(cwd),
+            db_uri=config.state_db_uri(),
+            keep_last=args.keep_last,
+        )
+        payload = {
+            "keep_last": args.keep_last,
+            "dry_run": args.dry_run,
+            "runs_pruned": 0,
+            "artifacts_pruned": 0,
+            "artifact_bytes_pruned": 0,
+            "run_ids": run_ids,
+        }
+        if not args.dry_run:
+            for run_id in run_ids:
+                summary = _prune_run_records(
+                    database_path=config.state_path(cwd),
+                    db_uri=config.state_db_uri(),
+                    run_id=run_id,
+                )
+                _delete_run_artifacts(artifacts_root=config.artifacts_root(cwd), run_id=run_id)
+                payload["runs_pruned"] += summary["runs_pruned"]
+                payload["artifacts_pruned"] += summary["artifacts_pruned"]
+                payload["artifact_bytes_pruned"] += summary["artifact_bytes_pruned"]
+            if run_ids:
+                _vacuum_database(database_path=config.state_path(cwd), db_uri=config.state_db_uri())
+
+        if args.json:
+            print(json.dumps(payload, indent=2))
+        else:
+            print(f"runs selected: {len(run_ids)}")
+            print(f"keep last terminal runs: {args.keep_last}")
+            if args.dry_run:
+                print("mode: dry_run")
+            else:
+                print(f"runs pruned: {payload['runs_pruned']}")
+                print(f"artifacts pruned: {payload['artifacts_pruned']}")
+                print(f"artifact bytes pruned: {payload['artifact_bytes_pruned']}")
+            for run_id in run_ids:
+                print(f"run_id: {run_id}")
         return 0
 
     if args.command == "approve":
@@ -309,11 +704,32 @@ def main(argv: list[str] | None = None) -> int:
             print(str(error), file=sys.stderr)
             return 2
 
+        if payload.get("hold_type") == "plan_review":
+            payload["review_paths"] = _plan_review_paths(
+                database_path=config.state_path(cwd),
+                artifacts_root=config.artifacts_root(cwd),
+                hold_context=payload.get("hold_context"),
+                db_uri=config.state_db_uri(),
+            )
+
         if args.json:
             print(json.dumps(payload, indent=2))
         else:
-            for key, value in payload.items():
-                print(f"{key}: {value}")
+            print(f"run_id: {payload['run_id']}")
+            print(f"status: {payload['state']}")
+            if payload.get("operator_status") is not None:
+                print(f"operator_status: {payload['operator_status']}")
+            _print_hold_guidance(
+                run_id=payload["run_id"],
+                hold_type=payload.get("hold_type"),
+                hold_reason=payload.get("hold_reason"),
+                hold_context=payload.get("hold_context"),
+                database_path=config.state_path(cwd),
+                artifacts_root=config.artifacts_root(cwd),
+                db_uri=config.state_db_uri(),
+                cwd=args.cwd,
+                config_path=args.config_path,
+            )
         return 0
 
     if args.command == "patch-policy":

@@ -61,7 +61,7 @@ from grind.models import (
 )
 from grind.policy import PolicyLoader
 from grind.policy.models import PolicyPack, ValidationCommandSpec
-from grind.providers import ModelInvocationError, ModelInvocationResult, extract_json_output, invoke_text_prompt
+from grind.providers import ModelInvocationError, ModelInvocationResult, extract_json_output, extract_text_output, invoke_text_prompt
 from grind.retrieval import LanceDBRetrievalService
 from grind.state import bootstrap_state_store, open_state_store
 from grind.validation import ValidationExecutionResult, run_validation_commands
@@ -91,6 +91,81 @@ def generate_run_id() -> str:
     return _prefixed_id("run")
 
 
+def _planning_response_text(result: ModelInvocationResult | None, fallback: str) -> str:
+    if result is not None:
+        extracted = extract_text_output(result.stdout)
+        if extracted.strip():
+            stripped_stdout = result.stdout.strip()
+            if extracted.strip() != stripped_stdout:
+                return extracted.strip()
+
+        stripped_stdout = result.stdout.strip()
+        if stripped_stdout:
+            try:
+                parsed = json.loads(stripped_stdout)
+            except json.JSONDecodeError:
+                parsed = None
+
+            if isinstance(parsed, dict):
+                for key in ("plan", "summary", "proposed_plan"):
+                    value = parsed.get(key)
+                    if isinstance(value, str) and value.strip():
+                        return value.strip()
+                    if isinstance(value, list):
+                        parts = [item.strip() for item in value if isinstance(item, str) and item.strip()]
+                        if parts:
+                            return "\n".join(parts)
+
+            if extracted.strip():
+                return extracted.strip()
+        if result.stderr.strip():
+            return result.stderr.strip()
+
+    fallback = fallback.strip()
+    if fallback:
+        return fallback
+    return "Planner returned no reviewable text."
+
+
+def _render_plan_review_markdown(
+    *,
+    objective: str,
+    response_text: str,
+    replan: bool = False,
+) -> str:
+    lines = [
+        "# Plan Review",
+        "",
+        "This run is waiting for operator approval before implementation continues.",
+        "",
+        "Approve if the plan is scoped to the objective, concrete, and includes validation.",
+        "Reject if the plan is vague, off-scope, unsafe, or missing a clear validation path.",
+        "",
+        "## Objective",
+        "",
+        objective.strip(),
+        "",
+    ]
+    if replan:
+        lines.extend([
+            "## Context",
+            "",
+            "This is a replanned proposal after an operator rejection.",
+            "",
+        ])
+    lines.extend([
+        "## Proposed Plan",
+        "",
+        response_text.strip() or "Planner returned no reviewable text. Reject and request replanning.",
+        "",
+        "## Operator Actions",
+        "",
+        "- Approve to let grind continue into implementation.",
+        "- Reject if the plan is not good enough and request replanning.",
+    ])
+    return "\n".join(lines).rstrip() + "\n"
+
+
 @dataclass(frozen=True)
 class RunOutcome:
     run_id: str
@@ -99,6 +174,9 @@ class RunOutcome:
     checkpoint_id: str
     final_state: RunState
     operator_status: OperatorStatus
+    hold_type: str | None
+    hold_reason: str | None
+    hold_context: dict[str, object] | None
     database_path: Path
     artifacts_root: Path
 
@@ -110,6 +188,9 @@ class ResumeOutcome:
     validation_stage_id: str
     final_state: RunState
     operator_status: OperatorStatus
+    hold_type: str | None
+    hold_reason: str | None
+    hold_context: dict[str, object] | None
     restored_checkpoint_id: str | None
     database_path: Path
     artifacts_root: Path
@@ -414,6 +495,9 @@ class MinimalOrchestrator:
 
         final_state = RunState.FAILED
         final_operator_status = OperatorStatus.NONE
+        final_hold_type: str | None = None
+        final_hold_reason: str | None = None
+        final_hold_context: dict[str, object] | None = None
 
         with self._open_store() as store:
             store.runs.create(run)
@@ -428,40 +512,34 @@ class MinimalOrchestrator:
                     planning_result = invoke_text_prompt(planner, prompt=planning_prompt, cwd=self.cwd)
                     planning_status = StageStatus.COMPLETED
                     planning_summary = "Planner response persisted for operator review."
-                    response_content = planning_result.stdout
                 except ModelInvocationError as error:
                     planning_result = error.result
                     planning_status = StageStatus.FAILED
                     planning_summary = str(error)
-                    response_content = planning_result.stdout if planning_result is not None else planning_summary
+
+                response_content = _planning_response_text(planning_result, planning_summary)
 
                 response_artifact = self.artifact_store.write_text(
                     run_id=run_id,
                     artifact_id=response_artifact_id,
                     artifact_type="planning_response",
                     content=response_content + "\n",
-                    suffix=".json",
+                    suffix=".md",
                     metadata={
                         "stage_name": "planning",
                         "provider": planner.provider,
                         "model": planner.model,
                     },
                 )
-                plan_artifact = self.artifact_store.write_json(
+                plan_artifact = self.artifact_store.write_text(
                     run_id=run_id,
                     artifact_id=plan_artifact_id,
                     artifact_type="plan_review",
-                    payload={
-                        "objective": objective,
-                        "source_kind": source_kind.value,
-                        "provider": planner.provider,
-                        "model": planner.model,
-                        "agent": planner.agent,
-                        "variant": planner.variant,
-                        "command": planning_result.command if planning_result else None,
-                        "response_artifact_id": response_artifact.artifact_id,
-                        "note": "Review the planner response artifact, then use grind resume to continue.",
-                    },
+                    content=_render_plan_review_markdown(
+                        objective=objective,
+                        response_text=response_content,
+                    ),
+                    suffix=".md",
                     metadata={"stage_name": "planning"},
                 )
                 store.artifacts.create(response_artifact)
@@ -535,6 +613,13 @@ class MinimalOrchestrator:
                     )
                     final_state = RunState.AWAITING_OPERATOR
                     final_operator_status = OperatorStatus.HOLD
+                    final_hold_type = HoldType.PLAN_REVIEW.value
+                    final_hold_reason = "awaiting operator review of planner output"
+                    final_hold_context = {
+                        "planning_stage_id": planning_stage_id,
+                        "response_artifact_id": response_artifact.artifact_id,
+                        "plan_artifact_id": plan_artifact.artifact_id,
+                    }
 
         outcome = RunOutcome(
             run_id=run_id,
@@ -543,6 +628,9 @@ class MinimalOrchestrator:
             checkpoint_id=checkpoint_id,
             final_state=final_state,
             operator_status=final_operator_status,
+            hold_type=final_hold_type,
+            hold_reason=final_hold_reason,
+            hold_context=final_hold_context,
             database_path=self.database_path,
             artifacts_root=self.artifacts_root,
         )
@@ -581,6 +669,27 @@ class MinimalOrchestrator:
                 run.current_hold_type == HoldType.PLAN_REVIEW
                 or (hold_transition is None or hold_transition.from_state == RunState.PLAN_REVIEW)
             )
+
+            def make_resume_outcome(
+                *,
+                validation_stage_id: str,
+                final_state: RunState,
+                operator_status: OperatorStatus,
+            ) -> ResumeOutcome:
+                updated_run = self._resolve_run(store, run_id)
+                return finalize(ResumeOutcome(
+                    run_id=run_id,
+                    task_id=task.task_id,
+                    validation_stage_id=validation_stage_id,
+                    final_state=final_state,
+                    operator_status=operator_status,
+                    hold_type=updated_run.current_hold_type.value if updated_run.current_hold_type else None,
+                    hold_reason=self._current_hold_reason(store, updated_run.run_id),
+                    hold_context=updated_run.current_hold_context,
+                    restored_checkpoint_id=restored_checkpoint_id,
+                    database_path=self.database_path,
+                    artifacts_root=self.artifacts_root,
+                ))
 
             try:
                 with self._lease_guard(store, run_id):
@@ -670,16 +779,11 @@ class MinimalOrchestrator:
                             observed_delta=observed_delta,
                         )
                         if cycle_status == "hold":
-                            return finalize(ResumeOutcome(
-                                run_id=run_id,
-                                task_id=task.task_id,
+                            return make_resume_outcome(
                                 validation_stage_id=validation_stage_id,
                                 final_state=RunState.AWAITING_OPERATOR,
                                 operator_status=OperatorStatus.HOLD,
-                                restored_checkpoint_id=restored_checkpoint_id,
-                                database_path=self.database_path,
-                                artifacts_root=self.artifacts_root,
-                            ))
+                            )
                         if cycle_status == "passed":
                             self._transition(
                                 store=store,
@@ -690,16 +794,11 @@ class MinimalOrchestrator:
                                 operator_status=OperatorStatus.NONE,
                             )
                             store.tasks.update_status(task.task_id, status=TaskStatus.COMPLETED.value)
-                            return finalize(ResumeOutcome(
-                                run_id=run_id,
-                                task_id=task.task_id,
+                            return make_resume_outcome(
                                 validation_stage_id=validation_stage_id,
                                 final_state=RunState.COMPLETED,
                                 operator_status=OperatorStatus.NONE,
-                                restored_checkpoint_id=restored_checkpoint_id,
-                                database_path=self.database_path,
-                                artifacts_root=self.artifacts_root,
-                            ))
+                            )
 
                         actionable_ids = {finding.stable_id for finding in actionable_findings}
                         run = self._resolve_run(store, run_id)
@@ -721,16 +820,11 @@ class MinimalOrchestrator:
                                 },
                             )
                             store.tasks.update_status(task.task_id, status=TaskStatus.IN_PROGRESS.value)
-                            return finalize(ResumeOutcome(
-                                run_id=run_id,
-                                task_id=task.task_id,
+                            return make_resume_outcome(
                                 validation_stage_id=validation_stage_id,
                                 final_state=RunState.AWAITING_OPERATOR,
                                 operator_status=OperatorStatus.HOLD,
-                                restored_checkpoint_id=restored_checkpoint_id,
-                                database_path=self.database_path,
-                                artifacts_root=self.artifacts_root,
-                            ))
+                            )
                         if iteration >= run.max_iterations:
                             self._transition(
                                 store=store,
@@ -750,16 +844,11 @@ class MinimalOrchestrator:
                                 },
                             )
                             store.tasks.update_status(task.task_id, status=TaskStatus.IN_PROGRESS.value)
-                            return finalize(ResumeOutcome(
-                                run_id=run_id,
-                                task_id=task.task_id,
+                            return make_resume_outcome(
                                 validation_stage_id=validation_stage_id,
                                 final_state=RunState.AWAITING_OPERATOR,
                                 operator_status=OperatorStatus.HOLD,
-                                restored_checkpoint_id=restored_checkpoint_id,
-                                database_path=self.database_path,
-                                artifacts_root=self.artifacts_root,
-                            ))
+                            )
                         if run.budget_limit_usd is not None and run.total_cost_usd >= run.budget_limit_usd:
                             self._transition(
                                 store=store,
@@ -778,16 +867,11 @@ class MinimalOrchestrator:
                                 },
                             )
                             store.tasks.update_status(task.task_id, status=TaskStatus.IN_PROGRESS.value)
-                            return finalize(ResumeOutcome(
-                                run_id=run_id,
-                                task_id=task.task_id,
+                            return make_resume_outcome(
                                 validation_stage_id=validation_stage_id,
                                 final_state=RunState.AWAITING_OPERATOR,
                                 operator_status=OperatorStatus.HOLD,
-                                restored_checkpoint_id=restored_checkpoint_id,
-                                database_path=self.database_path,
-                                artifacts_root=self.artifacts_root,
-                            ))
+                            )
 
                         act_stage_id = _prefixed_id("stage")
                         self._capture_pre_act_checkpoint(
@@ -842,16 +926,11 @@ class MinimalOrchestrator:
                     current_hold_reason=str(error),
                     current_hold_context={"worker_id": self.worker_id},
                 )
-                return finalize(ResumeOutcome(
-                    run_id=run_id,
-                    task_id=task.task_id,
+                return make_resume_outcome(
                     validation_stage_id="",
                     final_state=RunState.AWAITING_OPERATOR,
                     operator_status=OperatorStatus.HOLD,
-                    restored_checkpoint_id=restored_checkpoint_id,
-                    database_path=self.database_path,
-                    artifacts_root=self.artifacts_root,
-                ))
+                )
 
         raise RuntimeError(f"resume terminated unexpectedly for run {run_id}")
 
@@ -1104,37 +1183,31 @@ class MinimalOrchestrator:
                 planning_result = invoke_text_prompt(planner, prompt=planning_prompt, cwd=self.cwd)
                 planning_status = StageStatus.COMPLETED
                 planning_summary = "Planner response persisted for operator review."
-                response_content = planning_result.stdout
             except ModelInvocationError as error:
                 planning_result = error.result
                 planning_status = StageStatus.FAILED
                 planning_summary = str(error)
-                response_content = planning_result.stdout if planning_result is not None else planning_summary
+
+            response_content = _planning_response_text(planning_result, planning_summary)
 
             response_artifact = self.artifact_store.write_text(
                 run_id=run_id,
                 artifact_id=response_artifact_id,
                 artifact_type="planning_response",
                 content=response_content + "\n",
-                suffix=".json",
+                suffix=".md",
                 metadata={"stage_name": "planning", "provider": planner.provider, "model": planner.model, "replan": True},
             )
-            plan_artifact = self.artifact_store.write_json(
+            plan_artifact = self.artifact_store.write_text(
                 run_id=run_id,
                 artifact_id=plan_artifact_id,
                 artifact_type="plan_review",
-                payload={
-                    "objective": task.raw_input,
-                    "source_kind": task.source_kind.value,
-                    "provider": planner.provider,
-                    "model": planner.model,
-                    "agent": planner.agent,
-                    "variant": planner.variant,
-                    "command": planning_result.command if planning_result else None,
-                    "response_artifact_id": response_artifact.artifact_id,
-                    "note": "Review the replanned response artifact, then use grind resume to continue.",
-                    "replan": True,
-                },
+                content=_render_plan_review_markdown(
+                    objective=task.raw_input,
+                    response_text=response_content,
+                    replan=True,
+                ),
+                suffix=".md",
                 metadata={"stage_name": "planning", "replan": True},
             )
             store.artifacts.create(response_artifact)

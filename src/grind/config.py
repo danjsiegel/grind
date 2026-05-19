@@ -150,9 +150,11 @@ def render_default_engine_config() -> str:
         #   and other append-only run artifacts.
         #
         # Retention
-        # - mode=manual means Grind does not auto-delete ledger data.
-        # - export_root is reserved for future export/prune flows.
-        # - keep_artifacts_days is informational until prune/export commands land.
+        # - mode=manual means Grind does not auto-delete ledger data; use
+        #   `grind prune` for explicit cleanup of old terminal runs.
+        # - export_root is reserved for future archive/export flows.
+        # - keep_artifacts_days is still informational until policy-driven
+        #   retention lands.
         #
         # Backend examples
         # - github_cli model values should match what your installed GitHub CLI

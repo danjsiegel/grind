@@ -174,6 +174,102 @@ def test_run_uses_default_engine_config_when_missing(tmp_path: Path, monkeypatch
     assert "state database:" in captured.out
 
 
+def test_run_plain_text_surfaces_plan_review_guidance(tmp_path: Path, monkeypatch, capsys) -> None:
+    monkeypatch.setattr(
+        "grind.engine.orchestrator.invoke_text_prompt",
+        lambda profile, *, prompt, cwd: ModelInvocationResult(
+            command=["fake-planner", "--json"],
+            stdout='{"plan":"review this objective"}',
+            stderr="",
+            returncode=0,
+        ),
+    )
+
+    exit_code = main(["run", "ship it", "--cwd", str(tmp_path)])
+    captured = capsys.readouterr()
+
+    assert exit_code == 0
+    assert "status: awaiting_operator" in captured.out
+    assert "hold: plan_review" in captured.out
+    assert "reason: awaiting operator review of planner output" in captured.out
+    assert "review plan: " in captured.out
+    assert ".grind/artifacts/" in captured.out
+    assert "approve: grind approve" in captured.out
+    assert "reject: grind reject" in captured.out
+    assert "resume after approval: grind resume" in captured.out
+
+
+def test_run_json_includes_plan_review_hold_context(tmp_path: Path, monkeypatch, capsys) -> None:
+    monkeypatch.setattr(
+        "grind.engine.orchestrator.invoke_text_prompt",
+        lambda profile, *, prompt, cwd: ModelInvocationResult(
+            command=["fake-planner", "--json"],
+            stdout='{"plan":"review this objective"}',
+            stderr="",
+            returncode=0,
+        ),
+    )
+
+    exit_code = main(["run", "ship it", "--cwd", str(tmp_path), "--json"])
+    payload = json.loads(capsys.readouterr().out)
+
+    assert exit_code == 0
+    assert payload["hold_type"] == "plan_review"
+    assert payload["hold_reason"] == "awaiting operator review of planner output"
+    assert payload["hold_context"]["plan_artifact_id"] is not None
+    assert payload["hold_context"]["response_artifact_id"] is not None
+    assert payload["review_paths"]["plan"].endswith(".md")
+    assert payload["review_paths"]["planner_response"].endswith(".md")
+
+    plan_review = Path(payload["review_paths"]["plan"]).read_text()
+    planner_response = Path(payload["review_paths"]["planner_response"]).read_text()
+
+    assert "# Plan Review" in plan_review
+    assert "## Objective" in plan_review
+    assert "## Proposed Plan" in plan_review
+    assert "review this objective" in plan_review
+    assert planner_response.strip() == "review this objective"
+
+
+def test_prune_removes_old_terminal_runs_and_artifacts(tmp_path: Path, monkeypatch, capsys) -> None:
+    monkeypatch.setattr(
+        "grind.engine.orchestrator.invoke_text_prompt",
+        lambda profile, *, prompt, cwd: ModelInvocationResult(
+            command=["fake-planner", "--json"],
+            stdout='{"plan":"review this objective"}',
+            stderr="",
+            returncode=0,
+        ),
+    )
+
+    run_ids: list[str] = []
+    for _ in range(3):
+        run_exit = main(["run", "ship it", "--cwd", str(tmp_path), "--json"])
+        run_payload = json.loads(capsys.readouterr().out)
+        assert run_exit == 0
+        run_ids.append(run_payload["run_id"])
+        abort_exit = main(["abort", run_payload["run_id"], "--cwd", str(tmp_path), "--json"])
+        assert abort_exit == 0
+        capsys.readouterr()
+
+    prune_exit = main(["prune", "--cwd", str(tmp_path), "--keep-last", "1", "--json"])
+    prune_payload = json.loads(capsys.readouterr().out)
+
+    assert prune_exit == 0
+    assert prune_payload["runs_pruned"] == 2
+    assert len(prune_payload["run_ids"]) == 2
+
+    database_path = tmp_path / ".grind" / "state" / "grind.duckdb"
+    with open_state_store(database_path) as store:
+        assert store.runs.get(run_ids[2]) is not None
+        assert store.runs.get(run_ids[0]) is None
+        assert store.runs.get(run_ids[1]) is None
+
+    assert not (tmp_path / ".grind" / "artifacts" / run_ids[0]).exists()
+    assert not (tmp_path / ".grind" / "artifacts" / run_ids[1]).exists()
+    assert (tmp_path / ".grind" / "artifacts" / run_ids[2]).exists()
+
+
 def test_run_creates_stored_run_with_real_planner_adapter(tmp_path: Path, monkeypatch, capsys) -> None:
     main(["init", "--cwd", str(tmp_path)])
     capsys.readouterr()
@@ -763,6 +859,42 @@ def test_hold_reason_returns_current_operator_hold_reason(tmp_path: Path, monkey
     assert hold_reason_payload["hold_type"] == "plan_review"
     assert hold_reason_payload["hold_reason"] == "awaiting operator review of planner output"
     assert hold_reason_payload["hold_context"]["planning_stage_id"] is not None
+    assert hold_reason_payload["review_paths"]["plan"].endswith(".md")
+    assert hold_reason_payload["review_paths"]["planner_response"].endswith(".md")
+
+
+def test_hold_reason_plain_text_surfaces_review_paths(tmp_path: Path, monkeypatch, capsys) -> None:
+    main(["init", "--cwd", str(tmp_path)])
+    capsys.readouterr()
+
+    monkeypatch.setattr(
+        "grind.engine.orchestrator.invoke_text_prompt",
+        lambda profile, *, prompt, cwd: _model_response_for_prompt(prompt),
+    )
+
+    run_exit = main(["run", "ship it", "--cwd", str(tmp_path), "--json"])
+    run_payload = json.loads(capsys.readouterr().out)
+
+    assert run_exit == 0
+
+    hold_reason_exit = main([
+        "hold-reason",
+        run_payload["run_id"],
+        "--cwd",
+        str(tmp_path),
+    ])
+    captured = capsys.readouterr()
+
+    assert hold_reason_exit == 0
+    assert "run_id: " in captured.out
+    assert "status: awaiting_operator" in captured.out
+    assert "hold: plan_review" in captured.out
+    assert "reason: awaiting operator review of planner output" in captured.out
+    assert "review plan: " in captured.out
+    assert ".grind/artifacts/" in captured.out
+    assert "approve: grind approve" in captured.out
+    assert "reject: grind reject" in captured.out
+    assert "resume after approval: grind resume" in captured.out
 
 
 def test_reject_replans_and_returns_to_plan_review_hold(tmp_path: Path, monkeypatch, capsys) -> None:
