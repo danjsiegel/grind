@@ -1,4 +1,5 @@
 .local/
+.grind/
 /.venv
 *.pyc
 /$tmpdir
