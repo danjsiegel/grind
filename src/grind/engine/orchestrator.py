@@ -91,12 +91,43 @@ def generate_run_id() -> str:
     return _prefixed_id("run")
 
 
+def _sanitize_planning_text(text: str) -> str:
+    cleaned = text.strip()
+    if not cleaned:
+        return ""
+
+    for marker in ("Here is the operator review plan:", "Here is the plan:"):
+        if marker in cleaned:
+            cleaned = cleaned.split(marker, 1)[1].strip()
+
+    lines = cleaned.splitlines()
+    first_heading = next((index for index, line in enumerate(lines) if line.startswith("#")), None)
+    if first_heading is not None:
+        cleaned = "\n".join(lines[first_heading:]).strip()
+
+    cut_markers = (
+        "\n## Operator Actions",
+        "\nNow I have all the context I need.",
+        "\nI notice the current rewritten thinking",
+        "\nCould you provide the next thinking",
+    )
+    cut_at = len(cleaned)
+    for marker in cut_markers:
+        index = cleaned.find(marker)
+        if index != -1:
+            cut_at = min(cut_at, index)
+    return cleaned[:cut_at].strip()
+
+
 def _planning_response_text(result: ModelInvocationResult | None, fallback: str) -> str:
     if result is not None:
         extracted = extract_text_output(result.stdout)
         if extracted.strip():
             stripped_stdout = result.stdout.strip()
             if extracted.strip() != stripped_stdout:
+                sanitized = _sanitize_planning_text(extracted)
+                if sanitized:
+                    return sanitized
                 return extracted.strip()
 
         stripped_stdout = result.stdout.strip()
@@ -110,18 +141,24 @@ def _planning_response_text(result: ModelInvocationResult | None, fallback: str)
                 for key in ("plan", "summary", "proposed_plan"):
                     value = parsed.get(key)
                     if isinstance(value, str) and value.strip():
-                        return value.strip()
+                        sanitized = _sanitize_planning_text(value)
+                        return sanitized or value.strip()
                     if isinstance(value, list):
                         parts = [item.strip() for item in value if isinstance(item, str) and item.strip()]
                         if parts:
-                            return "\n".join(parts)
+                            sanitized = _sanitize_planning_text("\n".join(parts))
+                            return sanitized or "\n".join(parts)
 
             if extracted.strip():
+                sanitized = _sanitize_planning_text(extracted)
+                if sanitized:
+                    return sanitized
                 return extracted.strip()
         if result.stderr.strip():
-            return result.stderr.strip()
+            sanitized = _sanitize_planning_text(result.stderr)
+            return sanitized or result.stderr.strip()
 
-    fallback = fallback.strip()
+    fallback = _sanitize_planning_text(fallback)
     if fallback:
         return fallback
     return "Planner returned no reviewable text."
@@ -2859,12 +2896,20 @@ class MinimalOrchestrator:
 
     def _planning_prompt(self, objective: str) -> str:
         return (
-            "You are planning a grind task. Produce a concise actionable plan for the operator review stage.\n\n"
+            "You are planning a grind task. Produce a concise actionable implementation plan for the current repository.\n\n"
             f"Repository: {self.cwd}\n"
             f"Objective: {objective.strip()}\n\n"
             "Constraints:\n"
-            "- Keep the plan scoped to the requested objective.\n"
-            "- Call out validation the operator should expect after implementation.\n"
+            "- Use the live workspace as the source of truth. Inspect the current code before claiming anything is complete.\n"
+            "- If the objective references prior run notes, results files, or earlier grind artifacts, treat them as advisory hints only; verify against the current repository and spec instead of trusting those notes.\n"
+            "- Keep the plan scoped to the requested objective and the next implementation slice that should be executed now.\n"
+            "- This is a planning step, not a verdict step. Do not declare the objective complete, verified, deferred, or out-of-scope in the plan.\n"
+            "- If completion is uncertain, the first plan steps must inspect the specific current files, tests, and spec clauses needed to prove or falsify the suspected gap.\n"
+            "- Do not trust summary notes like 'phase complete' without fresh evidence from the live repository gathered in this run.\n"
+            "- Include concrete implementation steps and the focused validation to run after the change.\n"
+            "- Do not produce an operator-review-only, check-only, or closeout-only plan unless the objective explicitly asks for review or audit work.\n"
+            "- Return exactly one JSON object with this shape and nothing else: {\"plan\":\"step-by-step implementation plan including focused validation\"}.\n"
+            "- The value of \"plan\" must contain only the final plan, not chain-of-thought, exploration notes, or tool transcript.\n"
             "- Prefer concrete steps over narrative.\n"
         )
 

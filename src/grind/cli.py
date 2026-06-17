@@ -8,7 +8,7 @@ import sys
 from pathlib import Path
 
 import shutil
-from grind.config import default_engine_config_path, init_engine_workspace, load_engine_config
+from grind.config import EngineConfig, default_engine_config_path, init_engine_workspace, load_engine_config
 from grind.engine.orchestrator import MinimalOrchestrator
 from grind.models.enums import TaskSourceKind
 from grind.providers import extract_text_output
@@ -124,7 +124,8 @@ def _extract_planner_review_text(payload: str) -> str:
     extracted = extract_text_output(payload)
     stripped = payload.strip()
     if extracted.strip() and extracted.strip() != stripped:
-        return extracted.strip()
+        sanitized = _sanitize_plan_text(extracted)
+        return sanitized or extracted.strip()
 
     if stripped:
         try:
@@ -136,13 +137,45 @@ def _extract_planner_review_text(payload: str) -> str:
             for key in ("plan", "summary", "proposed_plan"):
                 value = parsed.get(key)
                 if isinstance(value, str) and value.strip():
-                    return value.strip()
+                    sanitized = _sanitize_plan_text(value)
+                    return sanitized or value.strip()
                 if isinstance(value, list):
                     parts = [item.strip() for item in value if isinstance(item, str) and item.strip()]
                     if parts:
-                        return "\n".join(parts)
+                        combined = "\n".join(parts)
+                        sanitized = _sanitize_plan_text(combined)
+                        return sanitized or combined
 
-    return extracted.strip() or stripped
+    sanitized = _sanitize_plan_text(extracted or stripped)
+    return sanitized or extracted.strip() or stripped
+
+
+def _sanitize_plan_text(text: str) -> str:
+    cleaned = text.strip()
+    if not cleaned:
+        return ""
+
+    for marker in ("Here is the operator review plan:", "Here is the plan:"):
+        if marker in cleaned:
+            cleaned = cleaned.split(marker, 1)[1].strip()
+
+    lines = cleaned.splitlines()
+    first_heading = next((index for index, line in enumerate(lines) if line.startswith("#")), None)
+    if first_heading is not None:
+        cleaned = "\n".join(lines[first_heading:]).strip()
+
+    cut_markers = (
+        "\n## Operator Actions",
+        "\nNow I have all the context I need.",
+        "\nI notice the current rewritten thinking",
+        "\nCould you provide the next thinking",
+    )
+    cut_at = len(cleaned)
+    for marker in cut_markers:
+        index = cleaned.find(marker)
+        if index != -1:
+            cut_at = min(cut_at, index)
+    return cleaned[:cut_at].strip()
 
 
 def _looks_like_planning_prompt(text: str) -> bool:
@@ -150,8 +183,79 @@ def _looks_like_planning_prompt(text: str) -> bool:
     return stripped.startswith("You are planning a grind task.")
 
 
+def _extract_markdown_section(text: str, heading: str) -> str:
+    lines = text.splitlines()
+    start = None
+    for index, line in enumerate(lines):
+        if line.strip() == heading:
+            start = index + 1
+            break
+    if start is None:
+        return ""
+
+    end = len(lines)
+    for index in range(start, len(lines)):
+        if lines[index].startswith("## ") and lines[index].strip() != heading:
+            end = index
+            break
+    return "\n".join(lines[start:end]).strip()
+
+
 def _synthesize_legacy_plan_review(*, plan_path: Path, planner_response_path: Path | None) -> Path | None:
-    if plan_path.suffix.lower() != ".json" or not plan_path.exists():
+    if not plan_path.exists():
+        return None
+
+    if plan_path.suffix.lower() == ".md":
+        try:
+            plan_text = plan_path.read_text(encoding="utf-8")
+        except OSError:
+            return None
+
+        objective = _extract_markdown_section(plan_text, "## Objective") or "Objective unavailable."
+        response_text = ""
+        if planner_response_path is not None and planner_response_path.exists():
+            try:
+                response_text = _extract_planner_review_text(planner_response_path.read_text(encoding="utf-8"))
+            except OSError:
+                response_text = ""
+        if not response_text:
+            response_text = _sanitize_plan_text(_extract_markdown_section(plan_text, "## Proposed Plan"))
+
+        if not response_text or _looks_like_planning_prompt(response_text):
+            return None
+
+        proposed_section = _extract_markdown_section(plan_text, "## Proposed Plan")
+        if response_text == proposed_section.strip() and "Here is the operator review plan:" not in proposed_section:
+            return None
+
+        synthesized_path = plan_path.with_name(f"{plan_path.stem}_clean.md")
+        synthesized_path.write_text(
+            "\n".join(
+                [
+                    "# Plan Review",
+                    "",
+                    "This review brief was cleaned from a noisy planner transcript.",
+                    "",
+                    "## Objective",
+                    "",
+                    objective.strip(),
+                    "",
+                    "## Proposed Plan",
+                    "",
+                    response_text.strip(),
+                    "",
+                    "## Operator Actions",
+                    "",
+                    "- Approve only if this plan is specific, scoped, and reviewable.",
+                    "- Reject and replan if the proposal is still vague or mismatched to your goal.",
+                    "",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        return synthesized_path
+
+    if plan_path.suffix.lower() != ".json":
         return None
 
     try:
@@ -320,6 +424,66 @@ def _delete_run_artifacts(*, artifacts_root: Path, run_id: str) -> None:
 def _vacuum_database(*, database_path: Path, db_uri: str | None) -> None:
     with open_state_store(database_path, db_uri=db_uri) as store:
         store.connection.execute("VACUUM")
+
+
+def _prune_run_ids(
+    *,
+    run_ids: list[str],
+    database_path: Path,
+    db_uri: str | None,
+    artifacts_root: Path,
+    retrieval_service: LanceDBRetrievalService | None,
+) -> dict[str, object]:
+    payload = {
+        "runs_pruned": 0,
+        "artifacts_pruned": 0,
+        "artifact_bytes_pruned": 0,
+        "retrieval_documents_pruned": 0,
+        "retrieval_collections_pruned": {},
+        "run_ids": run_ids,
+    }
+    for run_id in run_ids:
+        summary = _prune_run_records(
+            database_path=database_path,
+            db_uri=db_uri,
+            run_id=run_id,
+        )
+        _delete_run_artifacts(artifacts_root=artifacts_root, run_id=run_id)
+        payload["runs_pruned"] += summary["runs_pruned"]
+        payload["artifacts_pruned"] += summary["artifacts_pruned"]
+        payload["artifact_bytes_pruned"] += summary["artifact_bytes_pruned"]
+
+        if retrieval_service is not None:
+            retrieval_summary = retrieval_service.delete_run(run_id=run_id)
+            payload["retrieval_documents_pruned"] += retrieval_summary["documents_deleted"]
+            collections = payload["retrieval_collections_pruned"]
+            for collection, count in retrieval_summary["collections"].items():
+                collections[collection] = collections.get(collection, 0) + count
+
+    if run_ids:
+        _vacuum_database(database_path=database_path, db_uri=db_uri)
+    return payload
+
+
+def _auto_prune_if_configured(*, cwd: Path, config: EngineConfig, retrieval_service: LanceDBRetrievalService) -> dict[str, object] | None:
+    if config.retention.mode != "auto":
+        return None
+    keep_last = config.retention.keep_last_terminal_runs
+    if keep_last is None:
+        return None
+
+    run_ids = _terminal_run_ids_to_prune(
+        database_path=config.state_path(cwd),
+        db_uri=config.state_db_uri(),
+        keep_last=keep_last,
+    )
+    return _prune_run_ids(
+        run_ids=run_ids,
+        database_path=config.state_path(cwd),
+        db_uri=config.state_db_uri(),
+        artifacts_root=config.artifacts_root(cwd),
+        retrieval_service=retrieval_service,
+    )
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="grind")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -534,6 +698,9 @@ def main(argv: list[str] | None = None) -> int:
                 hold_context=outcome.hold_context,
                 db_uri=config.state_db_uri(),
             )
+        auto_prune = _auto_prune_if_configured(cwd=cwd, config=config, retrieval_service=retrieval_service)
+        if auto_prune is not None:
+            payload["auto_prune"] = auto_prune
         if args.json:
             print(json.dumps(payload, indent=2))
         else:
@@ -583,6 +750,9 @@ def main(argv: list[str] | None = None) -> int:
                 hold_context=outcome.hold_context,
                 db_uri=config.state_db_uri(),
             )
+        auto_prune = _auto_prune_if_configured(cwd=cwd, config=config, retrieval_service=retrieval_service)
+        if auto_prune is not None:
+            payload["auto_prune"] = auto_prune
         if args.json:
             print(json.dumps(payload, indent=2))
         else:
@@ -616,24 +786,28 @@ def main(argv: list[str] | None = None) -> int:
         payload = {
             "keep_last": args.keep_last,
             "dry_run": args.dry_run,
-            "runs_pruned": 0,
-            "artifacts_pruned": 0,
-            "artifact_bytes_pruned": 0,
             "run_ids": run_ids,
         }
         if not args.dry_run:
-            for run_id in run_ids:
-                summary = _prune_run_records(
+            payload.update(
+                _prune_run_ids(
+                    run_ids=run_ids,
                     database_path=config.state_path(cwd),
                     db_uri=config.state_db_uri(),
-                    run_id=run_id,
+                    artifacts_root=config.artifacts_root(cwd),
+                    retrieval_service=retrieval_service,
                 )
-                _delete_run_artifacts(artifacts_root=config.artifacts_root(cwd), run_id=run_id)
-                payload["runs_pruned"] += summary["runs_pruned"]
-                payload["artifacts_pruned"] += summary["artifacts_pruned"]
-                payload["artifact_bytes_pruned"] += summary["artifact_bytes_pruned"]
-            if run_ids:
-                _vacuum_database(database_path=config.state_path(cwd), db_uri=config.state_db_uri())
+            )
+        else:
+            payload.update(
+                {
+                    "runs_pruned": 0,
+                    "artifacts_pruned": 0,
+                    "artifact_bytes_pruned": 0,
+                    "retrieval_documents_pruned": 0,
+                    "retrieval_collections_pruned": {},
+                }
+            )
 
         if args.json:
             print(json.dumps(payload, indent=2))
@@ -646,6 +820,7 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"runs pruned: {payload['runs_pruned']}")
                 print(f"artifacts pruned: {payload['artifacts_pruned']}")
                 print(f"artifact bytes pruned: {payload['artifact_bytes_pruned']}")
+                print(f"retrieval documents pruned: {payload['retrieval_documents_pruned']}")
             for run_id in run_ids:
                 print(f"run_id: {run_id}")
         return 0
@@ -662,6 +837,10 @@ def main(argv: list[str] | None = None) -> int:
             print(str(error), file=sys.stderr)
             return 2
 
+        auto_prune = _auto_prune_if_configured(cwd=cwd, config=config, retrieval_service=retrieval_service)
+        if auto_prune is not None:
+            payload["auto_prune"] = auto_prune
+
         if args.json:
             print(json.dumps(payload, indent=2))
         else:
@@ -676,6 +855,10 @@ def main(argv: list[str] | None = None) -> int:
             print(str(error), file=sys.stderr)
             return 2
 
+        auto_prune = _auto_prune_if_configured(cwd=cwd, config=config, retrieval_service=retrieval_service)
+        if auto_prune is not None:
+            payload["auto_prune"] = auto_prune
+
         if args.json:
             print(json.dumps(payload, indent=2))
         else:
@@ -689,6 +872,10 @@ def main(argv: list[str] | None = None) -> int:
         except ValueError as error:
             print(str(error), file=sys.stderr)
             return 2
+
+        auto_prune = _auto_prune_if_configured(cwd=cwd, config=config, retrieval_service=retrieval_service)
+        if auto_prune is not None:
+            payload["auto_prune"] = auto_prune
 
         if args.json:
             print(json.dumps(payload, indent=2))

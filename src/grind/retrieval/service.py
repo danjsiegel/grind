@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import math
+import re
 import secrets
 from pathlib import Path
 from typing import Any
@@ -156,6 +158,7 @@ class LanceDBRetrievalService:
         db = lancedb.connect(str(self.db_path))
         vector_batch = self.embedding_adapter.embed_texts([query])
         vector = vector_batch.vectors[0]
+        strategy = self._search_strategy_for_backend(vector_batch.backend)
         requested_limit = limit or self.config.retrieval.max_search_results
         collection_names = [collection] if collection else [name for name in self._table_names(db) if not name.startswith("_")]
 
@@ -165,29 +168,27 @@ class LanceDBRetrievalService:
                 table = db.open_table(collection_name)
             except Exception:
                 continue
-            rows = table.search(vector).limit(max(requested_limit * 3, requested_limit)).to_list()
-            for row in rows:
-                if run_id is not None and not self._row_matches_run(row, run_id):
-                    continue
-                results.append(
-                    {
-                        "collection": collection_name,
-                        "chunk_id": row.get("chunk_id"),
-                        "run_id": row.get("run_id"),
-                        "artifact_id": row.get("artifact_id"),
-                        "artifact_type": row.get("artifact_type"),
-                        "chunk_text": row.get("chunk_text"),
-                        "metadata": self._decode_metadata(row.get("metadata_json")),
-                        "score": row.get("_distance"),
-                    }
+            all_rows = table.to_arrow().to_pylist()
+            filtered_rows = [row for row in all_rows if run_id is None or self._row_matches_run(row, run_id)]
+            results.extend(
+                self._search_collection(
+                    collection_name=collection_name,
+                    table=table,
+                    rows=filtered_rows,
+                    query=query,
+                    vector=vector,
+                    strategy=strategy,
+                    limit=requested_limit,
                 )
+            )
 
-        results.sort(key=lambda item: item["score"] if item["score"] is not None else float("inf"))
+        results.sort(key=lambda item: item["score"], reverse=True)
         return {
             "enabled": True,
             "query": query,
             "run_id": run_id,
             "collection": collection,
+            "search_strategy": strategy,
             "results": results[:requested_limit],
         }
 
@@ -204,6 +205,32 @@ class LanceDBRetrievalService:
                 rows = [row for row in rows if self._row_matches_run(row, run_id)]
             stats[collection_name] = len(rows)
         return stats
+
+    def delete_run(self, *, run_id: str) -> dict[str, int]:
+        if not self.config.retrieval.enabled:
+            return {"enabled": False, "run_id": run_id, "documents_deleted": 0, "collections": {}}
+
+        db = lancedb.connect(str(self.db_path))
+        deleted = 0
+        collections: dict[str, int] = {}
+        delete_filter = f"run_id = {self._sql_literal(run_id)}"
+
+        for collection_name in [name for name in self._table_names(db) if not name.startswith("_")]:
+            table = db.open_table(collection_name)
+            rows = [row for row in table.to_arrow().to_pylist() if self._row_matches_run(row, run_id)]
+            run_rows = [row for row in rows if row.get("run_id") == run_id]
+            if not run_rows:
+                continue
+            table.delete(delete_filter)
+            collections[collection_name] = len(run_rows)
+            deleted += len(run_rows)
+
+        return {
+            "enabled": True,
+            "run_id": run_id,
+            "documents_deleted": deleted,
+            "collections": collections,
+        }
 
     def _documents_for_artifact(
         self,
@@ -447,3 +474,130 @@ class LanceDBRetrievalService:
             return json.loads(payload)
         except (TypeError, json.JSONDecodeError):
             return {"raw": payload}
+
+    def _search_strategy_for_backend(self, backend: str) -> str:
+        if backend == "hash-fallback":
+            return "hybrid_hash_lexical"
+        if backend == "empty":
+            return "lexical"
+        return "vector"
+
+    def _search_collection(
+        self,
+        *,
+        collection_name: str,
+        table: Any,
+        rows: list[dict[str, object]],
+        query: str,
+        vector: list[float],
+        strategy: str,
+        limit: int,
+    ) -> list[dict[str, object]]:
+        candidates: dict[str, dict[str, object]] = {}
+
+        if strategy in {"hybrid_hash_lexical", "vector"}:
+            for row in self._vector_candidates(table=table, vector=vector, limit=limit):
+                chunk_id = str(row.get("chunk_id"))
+                vector_score = self._distance_to_similarity(row.get("_distance"))
+                candidates[chunk_id] = self._candidate_payload(
+                    collection_name=collection_name,
+                    row=row,
+                    lexical_score=0.0,
+                    vector_score=vector_score,
+                )
+
+        if strategy in {"hybrid_hash_lexical", "lexical"}:
+            for row in rows:
+                lexical_score = self._lexical_score(query, row.get("chunk_text"))
+                if lexical_score <= 0:
+                    continue
+                chunk_id = str(row.get("chunk_id"))
+                existing = candidates.get(chunk_id)
+                if existing is None:
+                    candidates[chunk_id] = self._candidate_payload(
+                        collection_name=collection_name,
+                        row=row,
+                        lexical_score=lexical_score,
+                        vector_score=0.0,
+                    )
+                else:
+                    existing["lexical_score"] = max(float(existing["lexical_score"]), lexical_score)
+
+        for candidate in candidates.values():
+            candidate["score"] = self._final_search_score(
+                lexical_score=float(candidate["lexical_score"]),
+                vector_score=float(candidate["vector_score"]),
+                strategy=strategy,
+            )
+
+        return sorted(candidates.values(), key=lambda item: item["score"], reverse=True)[: max(limit * 3, limit)]
+
+    def _vector_candidates(self, *, table: Any, vector: list[float], limit: int) -> list[dict[str, object]]:
+        try:
+            return table.search(vector).limit(max(limit * 3, limit)).to_list()
+        except Exception:
+            return []
+
+    def _candidate_payload(
+        self,
+        *,
+        collection_name: str,
+        row: dict[str, object],
+        lexical_score: float,
+        vector_score: float,
+    ) -> dict[str, object]:
+        return {
+            "collection": collection_name,
+            "chunk_id": row.get("chunk_id"),
+            "run_id": row.get("run_id"),
+            "artifact_id": row.get("artifact_id"),
+            "artifact_type": row.get("artifact_type"),
+            "chunk_text": row.get("chunk_text"),
+            "metadata": self._decode_metadata(row.get("metadata_json")),
+            "lexical_score": lexical_score,
+            "vector_score": vector_score,
+            "score": 0.0,
+        }
+
+    def _lexical_score(self, query: str, chunk_text: object) -> float:
+        if not isinstance(chunk_text, str):
+            return 0.0
+
+        query_tokens = self._tokenize(query)
+        document_tokens = self._tokenize(chunk_text)
+        if not query_tokens or not document_tokens:
+            return 0.0
+
+        query_counts: dict[str, int] = {}
+        for token in query_tokens:
+            query_counts[token] = query_counts.get(token, 0) + 1
+
+        document_counts: dict[str, int] = {}
+        for token in document_tokens:
+            document_counts[token] = document_counts.get(token, 0) + 1
+
+        overlap = sum(min(document_counts.get(token, 0), count) for token, count in query_counts.items())
+        if overlap == 0:
+            return 0.0
+
+        coverage = overlap / max(len(query_tokens), 1)
+        density = overlap / max(len(document_tokens), 1)
+        phrase_bonus = 0.15 if query.strip().lower() in chunk_text.lower() else 0.0
+        return coverage * 0.8 + density * 0.2 + phrase_bonus
+
+    def _final_search_score(self, *, lexical_score: float, vector_score: float, strategy: str) -> float:
+        if strategy == "hybrid_hash_lexical":
+            return lexical_score * 0.75 + vector_score * 0.25
+        if strategy == "lexical":
+            return lexical_score
+        return vector_score
+
+    def _distance_to_similarity(self, distance: object) -> float:
+        if not isinstance(distance, (int, float)):
+            return 0.0
+        if math.isnan(distance):
+            return 0.0
+        return 1.0 / (1.0 + max(float(distance), 0.0))
+
+    def _tokenize(self, text: str) -> list[str]:
+        return re.findall(r"[A-Za-z0-9_./:-]+", text.lower())

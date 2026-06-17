@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 from decimal import Decimal
+import json
 from pathlib import Path
 
 from grind.config import ModelProfileConfig
-from grind.providers.runtime import invoke_text_prompt
+from grind.providers.runtime import extract_json_output, extract_text_output, invoke_text_prompt
 
 
 class _CompletedProcess:
@@ -58,3 +59,53 @@ def test_invoke_text_prompt_extracts_kilo_cli_usage(monkeypatch, tmp_path: Path)
         "output_tokens": 34,
         "reported_model": "qwen-3.6-plus",
     }
+
+
+def test_extract_text_output_prefers_embedded_json_payload() -> None:
+    stdout = """
+Planner transcript noise.
+
+```json
+{"plan":"inspect live code first\\nrun focused tests second"}
+```
+"""
+
+    assert extract_text_output(stdout) == "inspect live code first\nrun focused tests second"
+
+
+def test_extract_json_output_reads_embedded_json_payload() -> None:
+    stdout = """
+Noise before the final answer.
+
+```json
+{"plan":"inspect live code first"}
+```
+"""
+
+    assert extract_json_output(stdout) == {"plan": "inspect live code first"}
+
+
+def test_extract_text_output_prefers_embedded_json_payload_with_nested_fences() -> None:
+    plan = """## Phase 2 Implementation Plan
+
+### Step 1
+Run focused validation.
+
+```bash
+uv run pytest tests/test_runtime.py -q
+```
+
+### Step 2
+Stop on the first failure.
+"""
+    stdout = f"""
+Planner transcript noise before the final answer.
+
+```json
+{json.dumps({'plan': plan})}
+```
+
+Trailing transcript that should not be treated as the plan.
+"""
+
+    assert extract_text_output(stdout).strip() == plan.strip()

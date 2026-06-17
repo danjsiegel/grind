@@ -41,6 +41,8 @@ def test_load_engine_config_reads_model_profiles(tmp_path: Path) -> None:
     assert config.retrieval.workspace_spec_globs == [".local/specs/**/*.md"]
     assert config.models["planner"].provider == "github_cli"
     assert config.models["planner"].model == DEFAULT_GITHUB_MODEL
+    assert config.retention.mode == "manual"
+    assert config.retention.keep_last_terminal_runs is None
     assert config.models["implementer"].model == DEFAULT_KILO_MODEL
     assert config.models["implementer"].variant == "thinking"
     assert config.models["checker"].model == DEFAULT_KILO_MODEL

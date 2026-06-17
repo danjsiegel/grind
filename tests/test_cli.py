@@ -3,10 +3,14 @@ from __future__ import annotations
 from decimal import Decimal
 import json
 from pathlib import Path
+import yaml
 
 from grind.cli import main
+from grind.config import load_engine_config
 from grind.models import OperatorActionType
 from grind.providers import ModelInvocationResult
+from grind.retrieval import LanceDBRetrievalService
+from grind.retrieval.embeddings import EmbeddingBatchResult
 from grind.state import open_state_store
 from grind.validation import ValidationExecutionResult
 from grind.verification.models import (
@@ -138,6 +142,7 @@ def test_init_writes_default_engine_yaml(tmp_path: Path, capsys) -> None:
     assert "root: .grind/artifacts" in content
     assert "enabled: true" in content
     assert "path: .grind/state/lancedb" in content
+    assert "keep_last_terminal_runs:" in content
     assert "validation:" in content
     assert "schema version: 6" in captured.out
 
@@ -231,6 +236,101 @@ def test_run_json_includes_plan_review_hold_context(tmp_path: Path, monkeypatch,
     assert planner_response.strip() == "review this objective"
 
 
+def test_run_json_strips_transcript_noise_from_plan_review(tmp_path: Path, monkeypatch, capsys) -> None:
+    noisy_response = """
+You are planning a grind task. Produce a concise actionable plan for the operator review stage.
+
+Let me inspect the repo.
+Here is the operator review plan:
+
+## Actual Plan
+
+1. Run the focused phase-2 tests.
+2. If green, run the full suite.
+3. Stop on the first failing validation.
+
+## Operator Actions
+
+- Approve to continue.
+
+Now I have all the context I need.
+Could you provide the next thinking that needs to be rewritten?
+""".strip()
+
+    monkeypatch.setattr(
+        "grind.engine.orchestrator.invoke_text_prompt",
+        lambda profile, *, prompt, cwd: ModelInvocationResult(
+            command=["fake-planner", "--json"],
+            stdout=noisy_response,
+            stderr="",
+            returncode=0,
+        ),
+    )
+
+    exit_code = main(["run", "ship it", "--cwd", str(tmp_path), "--json"])
+    payload = json.loads(capsys.readouterr().out)
+
+    assert exit_code == 0
+
+    plan_review = Path(payload["review_paths"]["plan"]).read_text()
+    planner_response = Path(payload["review_paths"]["planner_response"]).read_text()
+
+    assert "## Actual Plan" in plan_review
+    assert "Run the focused phase-2 tests" in plan_review
+    assert "Could you provide the next thinking" not in plan_review
+    assert "Here is the operator review plan:" not in plan_review
+    assert planner_response.strip().startswith("## Actual Plan")
+    assert "Could you provide the next thinking" not in planner_response
+
+
+def test_run_json_prefers_embedded_plan_payload_over_transcript(tmp_path: Path, monkeypatch, capsys) -> None:
+    plan = """## Phase 2 Implementation Plan
+
+### Step 1
+Verify the Phase 2 seams against the live code.
+
+```bash
+uv run pytest tests/test_phase2_seams.py -q
+```
+
+### Step 2
+Only continue if validation stays green.
+"""
+    noisy_response = (
+        "# Kepler Context\n\n"
+        "Use this skill when the task needs more than the always-on repo instructions.\n\n"
+        "Let me inspect the live repo first.\n\n"
+        "```json\n"
+        f"{json.dumps({'plan': plan})}\n"
+        "```\n\n"
+        "Now I have enough context to keep thinking out loud.\n"
+    )
+
+    monkeypatch.setattr(
+        "grind.engine.orchestrator.invoke_text_prompt",
+        lambda profile, *, prompt, cwd: ModelInvocationResult(
+            command=["fake-planner", "--json"],
+            stdout=noisy_response,
+            stderr="",
+            returncode=0,
+        ),
+    )
+
+    exit_code = main(["run", "ship it", "--cwd", str(tmp_path), "--json"])
+    payload = json.loads(capsys.readouterr().out)
+
+    assert exit_code == 0
+
+    plan_review = Path(payload["review_paths"]["plan"]).read_text()
+    planner_response = Path(payload["review_paths"]["planner_response"]).read_text()
+
+    assert "## Phase 2 Implementation Plan" in plan_review
+    assert "uv run pytest tests/test_phase2_seams.py -q" in plan_review
+    assert "# Kepler Context" not in plan_review
+    assert "Now I have enough context" not in plan_review
+    assert planner_response.strip() == plan.strip()
+
+
 def test_prune_removes_old_terminal_runs_and_artifacts(tmp_path: Path, monkeypatch, capsys) -> None:
     monkeypatch.setattr(
         "grind.engine.orchestrator.invoke_text_prompt",
@@ -258,6 +358,7 @@ def test_prune_removes_old_terminal_runs_and_artifacts(tmp_path: Path, monkeypat
     assert prune_exit == 0
     assert prune_payload["runs_pruned"] == 2
     assert len(prune_payload["run_ids"]) == 2
+    assert prune_payload["retrieval_documents_pruned"] >= 0
 
     database_path = tmp_path / ".grind" / "state" / "grind.duckdb"
     with open_state_store(database_path) as store:
@@ -268,6 +369,97 @@ def test_prune_removes_old_terminal_runs_and_artifacts(tmp_path: Path, monkeypat
     assert not (tmp_path / ".grind" / "artifacts" / run_ids[0]).exists()
     assert not (tmp_path / ".grind" / "artifacts" / run_ids[1]).exists()
     assert (tmp_path / ".grind" / "artifacts" / run_ids[2]).exists()
+
+
+def test_auto_prune_keeps_only_configured_terminal_runs(tmp_path: Path, monkeypatch, capsys) -> None:
+    main(["init", "--cwd", str(tmp_path)])
+    capsys.readouterr()
+
+    config_path = tmp_path / ".grind" / "engine.yaml"
+    config_data = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    config_data["retention"]["mode"] = "auto"
+    config_data["retention"]["keep_last_terminal_runs"] = 1
+    config_path.write_text(yaml.safe_dump(config_data, sort_keys=False), encoding="utf-8")
+
+    monkeypatch.setattr(
+        "grind.engine.orchestrator.invoke_text_prompt",
+        lambda profile, *, prompt, cwd: ModelInvocationResult(
+            command=["fake-planner", "--json"],
+            stdout='{"plan":"review this objective"}',
+            stderr="",
+            returncode=0,
+        ),
+    )
+
+    run_ids: list[str] = []
+    last_abort_payload: dict[str, object] | None = None
+    for _ in range(3):
+        run_exit = main(["run", "ship it", "--cwd", str(tmp_path), "--json"])
+        run_payload = json.loads(capsys.readouterr().out)
+        assert run_exit == 0
+        run_ids.append(run_payload["run_id"])
+
+        abort_exit = main(["abort", run_payload["run_id"], "--cwd", str(tmp_path), "--json"])
+        last_abort_payload = json.loads(capsys.readouterr().out)
+        assert abort_exit == 0
+
+    assert last_abort_payload is not None
+    assert last_abort_payload["auto_prune"]["runs_pruned"] == 1
+
+    database_path = tmp_path / ".grind" / "state" / "grind.duckdb"
+    with open_state_store(database_path) as store:
+        assert store.runs.get(run_ids[2]) is not None
+        assert store.runs.get(run_ids[0]) is None
+        assert store.runs.get(run_ids[1]) is None
+
+    assert not (tmp_path / ".grind" / "artifacts" / run_ids[0]).exists()
+    assert not (tmp_path / ".grind" / "artifacts" / run_ids[1]).exists()
+    assert (tmp_path / ".grind" / "artifacts" / run_ids[2]).exists()
+
+
+def test_prune_removes_retrieval_documents_for_pruned_runs(tmp_path: Path, monkeypatch, capsys) -> None:
+    main(["init", "--cwd", str(tmp_path)])
+    capsys.readouterr()
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+    monkeypatch.setattr(
+        "grind.engine.orchestrator.invoke_text_prompt",
+        lambda profile, *, prompt, cwd: ModelInvocationResult(
+            command=["fake-planner", "--json"],
+            stdout='{"plan":"review this objective"}',
+            stderr="",
+            returncode=0,
+        ),
+    )
+
+    run_ids: list[str] = []
+    for _ in range(2):
+        run_exit = main(["run", "ship it", "--cwd", str(tmp_path), "--json"])
+        run_payload = json.loads(capsys.readouterr().out)
+        assert run_exit == 0
+        run_ids.append(run_payload["run_id"])
+
+        abort_exit = main(["abort", run_payload["run_id"], "--cwd", str(tmp_path), "--json"])
+        assert abort_exit == 0
+        capsys.readouterr()
+
+    config = load_engine_config(tmp_path / ".grind" / "engine.yaml")
+    retrieval_service = LanceDBRetrievalService(cwd=tmp_path, config=config)
+
+    before = retrieval_service.collection_stats(run_id=run_ids[0])
+    assert before.get("run_summaries", 0) > 0
+
+    prune_exit = main(["prune", "--cwd", str(tmp_path), "--keep-last", "1", "--json"])
+    prune_payload = json.loads(capsys.readouterr().out)
+
+    assert prune_exit == 0
+    assert prune_payload["retrieval_documents_pruned"] > 0
+
+    after_pruned = retrieval_service.collection_stats(run_id=run_ids[0])
+    after_kept = retrieval_service.collection_stats(run_id=run_ids[1])
+
+    assert after_pruned.get("run_summaries", 0) == 0
+    assert after_kept.get("run_summaries", 0) > 0
 
 
 def test_run_creates_stored_run_with_real_planner_adapter(tmp_path: Path, monkeypatch, capsys) -> None:
@@ -545,6 +737,59 @@ def test_retrieval_index_search_and_report(tmp_path: Path, monkeypatch, capsys) 
 
     assert index_exit == 0
     assert index_payload["indexed_collections"]["docs_chunks"] > 0
+
+
+def test_retrieval_search_uses_hybrid_local_fallback_without_model(tmp_path: Path, monkeypatch, capsys) -> None:
+    (tmp_path / "README.md").write_text("Kepler rollout review notes live here.\n", encoding="utf-8")
+    main(["init", "--cwd", str(tmp_path)])
+    capsys.readouterr()
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+    monkeypatch.setattr(
+        "grind.retrieval.embeddings.ProviderEmbeddingAdapter.embed_texts",
+        lambda self, texts: EmbeddingBatchResult(
+            vectors=[[0.0] * self.config.embedding_dimensions for _ in texts],
+            backend="hash-fallback",
+            model=self.config.embedding_model,
+        ),
+    )
+    monkeypatch.setattr(
+        "grind.engine.orchestrator.invoke_text_prompt",
+        lambda profile, *, prompt, cwd: _model_response_for_prompt(prompt),
+    )
+    monkeypatch.setattr(
+        "grind.engine.orchestrator.run_validation_commands",
+        lambda cwd, commands, *, stop_on_failure, timeout_seconds: [
+            _validation_result(commands, returncode=0, stdout="passed", stderr="")
+        ],
+    )
+
+    run_exit = main(["run", "ship it", "--cwd", str(tmp_path), "--json"])
+    run_payload = json.loads(capsys.readouterr().out)
+    assert run_exit == 0
+
+    resume_exit = main(["resume", run_payload["run_id"], "--cwd", str(tmp_path), "--json"])
+    assert resume_exit == 0
+    capsys.readouterr()
+
+    search_exit = main([
+        "retrieval-search",
+        "rollout review notes",
+        "--collection",
+        "docs_chunks",
+        "--run-id",
+        run_payload["run_id"],
+        "--cwd",
+        str(tmp_path),
+        "--json",
+    ])
+    search_payload = json.loads(capsys.readouterr().out)
+
+    assert search_exit == 0
+    assert search_payload["search_strategy"] == "hybrid_hash_lexical"
+    assert search_payload["results"]
+    assert search_payload["results"][0]["collection"] == "docs_chunks"
+    assert "rollout review notes" in search_payload["results"][0]["chunk_text"].lower()
 
 
 def test_resume_runs_act_stage_before_returning_to_hold_on_persistent_blockers(

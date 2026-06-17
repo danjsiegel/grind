@@ -43,9 +43,10 @@ class RetrievalConfig(BaseModel):
 
 
 class RetentionConfig(BaseModel):
-    mode: Literal["manual"] = "manual"
+    mode: Literal["manual", "auto"] = "manual"
     export_root: str = ".grind/archive"
     keep_artifacts_days: int | None = None
+    keep_last_terminal_runs: int | None = Field(default=None, ge=0)
 
 
 class ValidationConfig(BaseModel):
@@ -152,6 +153,8 @@ def render_default_engine_config() -> str:
         # Retention
         # - mode=manual means Grind does not auto-delete ledger data; use
         #   `grind prune` for explicit cleanup of old terminal runs.
+        # - mode=auto prunes terminal runs after state-changing commands when
+        #   keep_last_terminal_runs is set.
         # - export_root is reserved for future archive/export flows.
         # - keep_artifacts_days is still informational until policy-driven
         #   retention lands.
@@ -193,6 +196,7 @@ def render_default_engine_config() -> str:
           mode: manual
           export_root: .grind/archive
           keep_artifacts_days:
+          keep_last_terminal_runs:
 
         validation:
           commands:

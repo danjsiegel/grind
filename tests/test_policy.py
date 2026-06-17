@@ -101,6 +101,25 @@ safe_paths:
     assert outcome.final_state.value == "awaiting_operator"
 
 
+def test_planning_prompt_requires_live_verification_and_implementation_plan(tmp_path: Path) -> None:
+    orchestrator = MinimalOrchestrator(cwd=tmp_path)
+
+    prompt = orchestrator._planning_prompt(
+        "Implement phase 2 from V1_1_HANDOFF.md using lab/local/grind/results.md as context"
+    )
+
+    assert "implementation plan for the current repository" in prompt
+    assert "Use the live workspace as the source of truth" in prompt
+    assert "treat them as advisory hints only" in prompt
+    assert "This is a planning step, not a verdict step" in prompt
+    assert "Do not declare the objective complete, verified, deferred, or out-of-scope in the plan" in prompt
+    assert "Do not trust summary notes like 'phase complete' without fresh evidence" in prompt
+    assert "Do not produce an operator-review-only, check-only, or closeout-only plan" in prompt
+    assert 'Return exactly one JSON object with this shape and nothing else: {"plan":"step-by-step implementation plan including focused validation"}.' in prompt
+    assert 'The value of "plan" must contain only the final plan' in prompt
+    assert "operator review stage" not in prompt
+
+
 def test_engine_prefers_policy_pack_validation_commands(tmp_path: Path, monkeypatch) -> None:
     init_engine_workspace(tmp_path)
     policy_dir = tmp_path / ".grind" / "policy"

@@ -73,7 +73,13 @@ def extract_text_output(stdout: str) -> str:
     if not stripped:
         return ""
 
-    parsed = _parse_json_maybe(stripped)
+    parsed = _parse_direct_json_maybe(stripped)
+    if parsed is None:
+        embedded = _extract_embedded_json_candidate(stripped)
+        if embedded is not None:
+            parsed = _parse_direct_json_maybe(embedded)
+    if parsed is None:
+        parsed = _parse_json_maybe(stripped)
     if parsed is None:
         return stripped
 
@@ -90,6 +96,12 @@ def extract_json_output(stdout: str) -> Any:
     try:
         return json.loads(payload)
     except json.JSONDecodeError as error:
+        embedded = _extract_embedded_json_candidate(stdout)
+        if embedded is not None:
+            try:
+                return json.loads(embedded)
+            except json.JSONDecodeError:
+                pass
         raise ModelInvocationError(f"model returned non-JSON response: {error}") from error
 
 
@@ -143,6 +155,44 @@ def _parse_json_maybe(payload: str) -> Any | None:
     return values or None
 
 
+def _parse_direct_json_maybe(payload: str) -> Any | None:
+    try:
+        return json.loads(payload)
+    except json.JSONDecodeError:
+        return None
+
+
+def _extract_embedded_json_candidate(payload: str) -> str | None:
+    decoder = json.JSONDecoder()
+    markers: list[int] = []
+    for marker in ("```json", "```"):
+        start = 0
+        while True:
+            index = payload.find(marker, start)
+            if index == -1:
+                break
+            markers.append(index)
+            start = index + len(marker)
+
+    for marker_index in sorted(set(markers), reverse=True):
+        candidate = payload[marker_index + 3 :].lstrip()
+        if candidate.lower().startswith("json"):
+            candidate = candidate[4:].lstrip()
+
+        starts = [position for position in (candidate.find("{"), candidate.find("[")) if position != -1]
+        if not starts:
+            continue
+        candidate = candidate[min(starts) :]
+
+        try:
+            _, end = decoder.raw_decode(candidate)
+        except json.JSONDecodeError:
+            continue
+        return candidate[:end]
+
+    return None
+
+
 def _extract_text_values(value: Any) -> list[str]:
     if isinstance(value, str):
         return [value]
@@ -153,7 +203,7 @@ def _extract_text_values(value: Any) -> list[str]:
         return output
     if isinstance(value, dict):
         output: list[str] = []
-        for key in ("output_text", "text", "content", "message"):
+        for key in ("output_text", "text", "content", "message", "plan"):
             if key in value:
                 output.extend(_extract_text_values(value[key]))
         for key in ("response", "data", "delta", "payload"):
