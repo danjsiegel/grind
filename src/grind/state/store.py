@@ -6,7 +6,7 @@ from pathlib import Path
 import duckdb
 
 from grind.state.repositories import DuckDBStateStore
-from grind.state.quack import QuackConnectionError, quack_connect
+from grind.state.quack import QuackConnectionError, ensure_local_quack_server, is_local_quack_uri, quack_connect
 
 
 MIGRATIONS_DIR = Path(__file__).with_name("migrations")
@@ -28,11 +28,19 @@ def _open_connection(
     effective_db_uri = db_uri or os.getenv("GRIND_DB_URI")
     if effective_db_uri and effective_db_uri.startswith("quack:"):
         effective_token = quack_token or os.getenv("GRIND_DB_TOKEN")
+        if not effective_token and is_local_quack_uri(effective_db_uri):
+            effective_token = ensure_local_quack_server(database_path, effective_db_uri)
         if not effective_token:
             raise QuackConnectionError(
                 "GRIND_DB_TOKEN is required when GRIND_DB_URI points at Quack"
             )
-        return quack_connect(effective_db_uri, effective_token)
+        try:
+            return quack_connect(effective_db_uri, effective_token)
+        except QuackConnectionError:
+            if not is_local_quack_uri(effective_db_uri):
+                raise
+            effective_token = ensure_local_quack_server(database_path, effective_db_uri, force_restart=True)
+            return quack_connect(effective_db_uri, effective_token)
 
     resolved_path = _resolve_database_path(database_path, db_uri=effective_db_uri)
     resolved_path.parent.mkdir(parents=True, exist_ok=True)

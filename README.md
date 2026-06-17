@@ -22,6 +22,7 @@ to hallucinate.
   and operator actions in DuckDB
 - runs planner, implementer, checker, and adjudicator steps with resumable holds
 - supports Quack-aware state bootstrapping for shared multi-worker setups
+- can auto-start a local Quack server for self-hosting when the workspace is configured with `state.db_uri: quack:localhost` and `state.require_quack: true`
 - keeps validation output and review artifacts instead of treating them as
   throwaway logs
 
@@ -130,6 +131,8 @@ Running `grind init --cwd "$TARGET_REPO"` creates these paths inside the target 
 - `.grind/artifacts/`
 - `.grind/archive/`
 
+`.grind/` is local runtime state. This repo now ignores it by default; if you previously tracked `.grind/verify/*.json`, remove them from the index so local backend probes stop creating Git churn.
+
 ---
 
 ## Configuration
@@ -199,6 +202,8 @@ Storage fields:
 |---|---|---|
 | `state.kind` | yes | currently `duckdb` |
 | `state.path` | yes | canonical ledger path; default `.grind/state/grind.duckdb` |
+| `state.db_uri` | no | set to a `quack:` URI to use Quack-backed shared state instead of direct local DuckDB |
+| `state.require_quack` | no | if `true`, Grind fails fast unless it can use Quack; for local `quack:localhost` it will auto-start a helper server |
 | `artifacts.root` | yes | local artifact root; default `.grind/artifacts` |
 | `retention.mode` | yes | currently `manual`; Grind does not auto-prune, but `grind prune` can remove old terminal runs and their artifacts |
 | `retention.export_root` | yes | reserved for future archive/export flows |
@@ -258,6 +263,20 @@ Exit codes: `0` all required probes passed, `1` a required probe failed, `2`
 configuration error or inconclusive result.
 
 ### `grind run`
+
+### Self-hosting without local DB lockouts
+
+If you want Grind to operate on itself or run multiple local worker processes, do not leave it on direct local DuckDB. Configure the local workspace like this instead:
+
+```yaml
+state:
+  kind: duckdb
+  path: .grind/state/grind.duckdb
+  db_uri: quack:localhost
+  require_quack: true
+```
+
+With that config, Grind will auto-start a local Quack helper the first time it needs the database. This avoids the single-process DuckDB file lock problem that makes `run`, `status`, `approve`, and `resume` fight each other during self-hosting.
 
 Create a real stored run in DuckDB.
 

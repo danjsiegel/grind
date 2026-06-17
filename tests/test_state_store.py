@@ -297,3 +297,28 @@ def test_bootstrap_state_store_can_route_through_quack_connection(tmp_path: Path
         ).fetchone()
 
     assert row == (6,)
+
+
+def test_open_state_store_auto_starts_local_quack_when_token_missing(tmp_path: Path, monkeypatch) -> None:
+    database_path = tmp_path / ".grind" / "state" / "grind.duckdb"
+    remote_path = tmp_path / "remote.duckdb"
+
+    monkeypatch.setenv("GRIND_DB_URI", "quack:localhost")
+    monkeypatch.delenv("GRIND_DB_TOKEN", raising=False)
+    monkeypatch.setattr(
+        "grind.state.store.ensure_local_quack_server",
+        lambda path, uri: "auto-token",
+    )
+    monkeypatch.setattr(
+        "grind.state.store.quack_connect",
+        lambda uri, token: duckdb.connect(str(remote_path)),
+    )
+
+    bootstrap_state_store(database_path)
+
+    with open_state_store(database_path) as store:
+        row = store.connection.execute(
+            "SELECT version FROM schema_version ORDER BY version DESC LIMIT 1"
+        ).fetchone()
+
+    assert row == (6,)
