@@ -7,7 +7,7 @@ import time
 
 from grind.engine.leases import LeaseConflictError, acquire_lease, expire_stale_leases, heartbeat_worker, release_lease
 from grind.engine.orchestrator import DoStageResponsePayload, MinimalOrchestrator
-from grind.models import HoldType, OperatorStatus, Run, RunLease, RunState, TaskSourceKind, Worker
+from grind.models import HoldType, OperatorStatus, Run, RunLease, RunState, Stage, StageStatus, TaskSourceKind, Worker
 from grind.providers import ModelInvocationResult
 from grind.validation import ValidationExecutionResult
 from grind.state import bootstrap_state_store, open_state_store
@@ -285,3 +285,68 @@ def test_resume_after_hold_allows_worker_handoff(tmp_path: Path, monkeypatch) ->
     assert len(leases) == 2
     assert latest_lease.worker_id == worker_b.worker_id
     assert latest_lease.status == "released"
+
+
+def test_resume_recovers_interrupted_doing_without_active_lease(tmp_path: Path, monkeypatch) -> None:
+    init_engine_workspace(tmp_path)
+    database_path = tmp_path / ".grind" / "state" / "grind.duckdb"
+
+    monkeypatch.setattr(
+        "grind.engine.orchestrator.invoke_text_prompt",
+        lambda profile, *, prompt, cwd: ModelInvocationResult(
+            command=["fake-planner"],
+            stdout='{"plan":"ship it"}',
+            stderr="",
+            returncode=0,
+        ),
+    )
+    monkeypatch.setattr(
+        MinimalOrchestrator,
+        "_run_do_stage",
+        lambda self, *, store, run, task, iteration: DoStageResponsePayload(
+            touched_files=["README.md"],
+            touched_symbols=[],
+            validation_hints=[],
+            claims_made=[],
+            open_uncertainties=[],
+            artifact_refs=[],
+        ),
+    )
+    monkeypatch.setattr(
+        MinimalOrchestrator,
+        "_run_validation_review_cycle",
+        lambda self, *, store, run, task, iteration, observed_delta: ("hold", "validation_stage_recovered", []),
+    )
+
+    orchestrator = MinimalOrchestrator(cwd=tmp_path)
+    run_outcome = orchestrator.run(objective="recover doing", source_kind=TaskSourceKind.INLINE)
+
+    with open_state_store(database_path) as store:
+        store.runs.update_state(
+            run_outcome.run_id,
+            state=RunState.DOING.value,
+            operator_status=OperatorStatus.NONE.value,
+        )
+        store.runs.clear_hold_context(run_outcome.run_id)
+        store.stages.create(
+            Stage(
+                stage_id="stage_interrupted_doing",
+                run_id=run_outcome.run_id,
+                task_id=run_outcome.task_id,
+                stage_name="doing",
+                status=StageStatus.RUNNING,
+                iteration=1,
+            )
+        )
+
+    resumed = MinimalOrchestrator(cwd=tmp_path).resume(run_id=run_outcome.run_id)
+
+    assert resumed.final_state == RunState.AWAITING_OPERATOR
+    with open_state_store(database_path) as store:
+        stages = [stage for stage in store.stages.list_by_run(run_outcome.run_id) if stage.stage_name == "doing"]
+        recovered_run = store.runs.get(run_outcome.run_id)
+
+    assert len(stages) == 1
+    assert stages[0].status == StageStatus.FAILED
+    assert recovered_run is not None
+    assert recovered_run.state == RunState.AWAITING_VALIDATION

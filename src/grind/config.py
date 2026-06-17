@@ -18,6 +18,7 @@ class StateConfig(BaseModel):
   kind: Literal["duckdb"] = "duckdb"
   path: str = ".grind/state/grind.duckdb"
   db_uri: str | None = None
+  require_quack: bool = False
 
 
 class ArtifactsConfig(BaseModel):
@@ -168,6 +169,7 @@ def render_default_engine_config() -> str:
           kind: duckdb
           path: .grind/state/grind.duckdb
           db_uri:
+          require_quack: false
 
         artifacts:
           root: .grind/artifacts

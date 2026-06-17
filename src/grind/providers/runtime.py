@@ -3,9 +3,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 import json
+import os
 from pathlib import Path
 from time import perf_counter
+import signal
 import subprocess
+import tempfile
 from typing import Any
 
 from grind.config import ModelProfileConfig
@@ -39,33 +42,92 @@ def invoke_text_prompt(
 ) -> ModelInvocationResult:
     command = _build_command(profile, prompt=prompt)
     started = perf_counter()
-    completed = subprocess.run(
-        command,
-        cwd=str(cwd),
-        capture_output=True,
-        text=True,
-        check=False,
-        timeout=timeout_seconds,
-    )
+    try:
+        stdout, stderr, returncode = _run_prompt_command(
+            command=command,
+            cwd=cwd,
+            timeout_seconds=timeout_seconds,
+        )
+    except _PromptTimeoutError as error:
+        latency_ms = int((perf_counter() - started) * 1000)
+        result = ModelInvocationResult(
+            command=command,
+            stdout=error.stdout,
+            stderr=error.stderr,
+            returncode=124,
+            latency_ms=latency_ms,
+            provider_metadata=_extract_provider_metadata(profile.provider, error.stdout),
+        )
+        raise ModelInvocationError(
+            f"model invocation timed out after {timeout_seconds} seconds",
+            result=result,
+        ) from error
     latency_ms = int((perf_counter() - started) * 1000)
-    provider_metadata = _extract_provider_metadata(profile.provider, completed.stdout)
+    provider_metadata = _extract_provider_metadata(profile.provider, stdout)
     result = ModelInvocationResult(
         command=command,
-        stdout=completed.stdout,
-        stderr=completed.stderr,
-        returncode=completed.returncode,
+        stdout=stdout,
+        stderr=stderr,
+        returncode=returncode,
         estimated_cost_usd=_coerce_decimal(provider_metadata.get("estimated_cost_usd")),
         input_tokens=_coerce_int(provider_metadata.get("input_tokens")),
         output_tokens=_coerce_int(provider_metadata.get("output_tokens")),
         latency_ms=latency_ms,
         provider_metadata=provider_metadata,
     )
-    if completed.returncode != 0:
+    if returncode != 0:
         raise ModelInvocationError(
-            completed.stderr or completed.stdout or "model invocation failed",
+            stderr or stdout or "model invocation failed",
             result=result,
         )
     return result
+
+
+@dataclass(frozen=True)
+class _PromptTimeoutError(RuntimeError):
+    stdout: str
+    stderr: str
+
+
+def _run_prompt_command(
+    *,
+    command: list[str],
+    cwd: Path,
+    timeout_seconds: int,
+) -> tuple[str, str, int]:
+    with tempfile.TemporaryDirectory(prefix="grind-model-") as temp_dir:
+        stdout_path = Path(temp_dir) / "stdout.txt"
+        stderr_path = Path(temp_dir) / "stderr.txt"
+        with stdout_path.open("w", encoding="utf-8") as stdout_handle, stderr_path.open("w", encoding="utf-8") as stderr_handle:
+            process = subprocess.Popen(
+                command,
+                cwd=str(cwd),
+                stdout=stdout_handle,
+                stderr=stderr_handle,
+                text=True,
+                start_new_session=True,
+            )
+            try:
+                returncode = process.wait(timeout=timeout_seconds)
+            except subprocess.TimeoutExpired as error:
+                _terminate_process_group(process.pid, sig=signal.SIGKILL)
+                process.wait(timeout=5)
+                stdout = stdout_path.read_text(encoding="utf-8")
+                stderr = stderr_path.read_text(encoding="utf-8")
+                raise _PromptTimeoutError(stdout=stdout, stderr=(stderr or str(error))) from error
+
+        stdout = stdout_path.read_text(encoding="utf-8")
+        stderr = stderr_path.read_text(encoding="utf-8")
+
+    _terminate_process_group(process.pid, sig=signal.SIGTERM)
+    return stdout, stderr, returncode
+
+
+def _terminate_process_group(pid: int, *, sig: signal.Signals) -> None:
+    try:
+        os.killpg(pid, sig)
+    except ProcessLookupError:
+        return
 
 
 def extract_text_output(stdout: str) -> str:

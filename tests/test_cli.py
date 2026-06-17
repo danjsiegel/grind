@@ -176,7 +176,7 @@ def test_run_uses_default_engine_config_when_missing(tmp_path: Path, monkeypatch
     assert exit_code == 0
     assert (tmp_path / ".grind" / "state" / "grind.duckdb").exists()
     assert "run_id:" in captured.out
-    assert "state database:" in captured.out
+    assert "status: awaiting_operator" in captured.out
 
 
 def test_run_plain_text_surfaces_plan_review_guidance(tmp_path: Path, monkeypatch, capsys) -> None:
@@ -691,6 +691,7 @@ def test_retrieval_index_search_and_report(tmp_path: Path, monkeypatch, capsys) 
     assert search_exit == 0
     assert search_payload["results"]
     assert search_payload["results"][0]["collection"] == "docs_chunks"
+    assert search_payload["collection_readiness"]["docs_chunks"]["state"] == "ready"
 
     spec_search_exit = main([
         "retrieval-search",
@@ -723,6 +724,7 @@ def test_retrieval_index_search_and_report(tmp_path: Path, monkeypatch, capsys) 
     assert report_payload["retrieval"]["documents_by_collection"]
     assert report_payload["retrieval"]["documents_by_collection"]["docs_chunks"] > 0
     assert report_payload["retrieval"]["documents_by_collection"]["spec_chunks"] > 0
+    assert report_payload["retrieval"]["readiness_by_collection"]["docs_chunks"]["state"] == "ready"
     assert report_payload["model_calls"]["total"] == 4
 
     index_exit = main([
@@ -790,6 +792,73 @@ def test_retrieval_search_uses_hybrid_local_fallback_without_model(tmp_path: Pat
     assert search_payload["results"]
     assert search_payload["results"][0]["collection"] == "docs_chunks"
     assert "rollout review notes" in search_payload["results"][0]["chunk_text"].lower()
+
+
+def test_retrieval_search_falls_back_to_lexical_when_collection_embeddings_are_incompatible(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    (tmp_path / "README.md").write_text("Rollout notes for lexical fallback live here.\n", encoding="utf-8")
+    main(["init", "--cwd", str(tmp_path)])
+    capsys.readouterr()
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+    monkeypatch.setattr(
+        "grind.engine.orchestrator.invoke_text_prompt",
+        lambda profile, *, prompt, cwd: _model_response_for_prompt(prompt),
+    )
+    monkeypatch.setattr(
+        "grind.engine.orchestrator.run_validation_commands",
+        lambda cwd, commands, *, stop_on_failure, timeout_seconds: [
+            _validation_result(commands, returncode=0, stdout="passed", stderr="")
+        ],
+    )
+
+    monkeypatch.setattr(
+        "grind.retrieval.embeddings.ProviderEmbeddingAdapter.embed_texts",
+        lambda self, texts: EmbeddingBatchResult(
+            vectors=[[1.0] * self.config.embedding_dimensions for _ in texts],
+            backend="openai",
+            model=self.config.embedding_model,
+        ),
+    )
+
+    run_exit = main(["run", "ship it", "--cwd", str(tmp_path), "--json"])
+    run_payload = json.loads(capsys.readouterr().out)
+    assert run_exit == 0
+
+    resume_exit = main(["resume", run_payload["run_id"], "--cwd", str(tmp_path), "--json"])
+    assert resume_exit == 0
+    capsys.readouterr()
+
+    monkeypatch.setattr(
+        "grind.retrieval.embeddings.ProviderEmbeddingAdapter.embed_texts",
+        lambda self, texts: EmbeddingBatchResult(
+            vectors=[[0.0] * self.config.embedding_dimensions for _ in texts],
+            backend="hash-fallback",
+            model=self.config.embedding_model,
+        ),
+    )
+
+    search_exit = main([
+        "retrieval-search",
+        "lexical fallback",
+        "--collection",
+        "docs_chunks",
+        "--run-id",
+        run_payload["run_id"],
+        "--cwd",
+        str(tmp_path),
+        "--json",
+    ])
+    search_payload = json.loads(capsys.readouterr().out)
+
+    assert search_exit == 0
+    assert search_payload["collection_readiness"]["docs_chunks"]["state"] == "incompatible"
+    assert search_payload["collection_readiness"]["docs_chunks"]["search_strategy"] == "lexical"
+    assert search_payload["results"]
+    assert "lexical fallback" in search_payload["results"][0]["chunk_text"].lower()
 
 
 def test_resume_runs_act_stage_before_returning_to_hold_on_persistent_blockers(

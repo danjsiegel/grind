@@ -7,8 +7,10 @@ import subprocess
 import duckdb
 
 from grind.cli import main
+from grind.engine.orchestrator import MinimalOrchestrator
 from grind.providers import ModelInvocationResult
 from grind.state import open_state_store
+from grind.state.quack import QuackConnectionError
 
 
 def _patch_quack_route(monkeypatch, tmp_path: Path) -> None:
@@ -133,3 +135,19 @@ def test_kilo_cli_quack_smoke(tmp_path: Path, monkeypatch, capsys) -> None:
     assert payload["overall_status"] == "passed"
 
     _assert_quack_run_smoke(tmp_path, capsys)
+
+
+def test_orchestrator_can_require_quack_via_config(tmp_path: Path) -> None:
+    assert main(["init", "--cwd", str(tmp_path)]) == 0
+    config_path = tmp_path / ".grind" / "engine.yaml"
+    config_path.write_text(
+        config_path.read_text(encoding="utf-8").replace("require_quack: false", "require_quack: true"),
+        encoding="utf-8",
+    )
+
+    try:
+        MinimalOrchestrator(cwd=tmp_path)
+    except QuackConnectionError as error:
+        assert "Quack is required by configuration" in str(error)
+    else:  # pragma: no cover - defensive
+        raise AssertionError("expected QuackConnectionError")

@@ -10,7 +10,10 @@ findings, and holds instead of leaving everything in terminal scrollback.
 The point is simple: do not trust a single pass. Plan the change, make the
 change, validate what actually happened, and run an independent check before
 calling it done. If a change cannot survive validation and review, Grind does
-not call it done.
+not call it done. The industry right now is going towards swarming with agents
+doing everything in parallel. Grind is the opposite: my thesis is that you should
+"Stop Building Swarms of Shit Agents" and instead scale a single agent that refuses
+to hallucinate. 
 
 ## What Grind does today
 
