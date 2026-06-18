@@ -1214,14 +1214,13 @@ class WorkerRepository:
         self.connection = connection
 
     def register(self, worker: Worker) -> Worker:
+        existing = self.get(worker.worker_id)
+        if existing is not None:
+            return existing
         self.connection.execute(
             """
             INSERT INTO workers (worker_id, hostname, pid, registered_at, last_seen_at)
             VALUES (?, ?, ?, ?, ?)
-            ON CONFLICT(worker_id) DO UPDATE SET
-              hostname = excluded.hostname,
-              pid = excluded.pid,
-              last_seen_at = excluded.last_seen_at
             """,
             [
                 worker.worker_id,

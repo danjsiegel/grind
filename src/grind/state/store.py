@@ -53,7 +53,18 @@ def bootstrap_state_store(
     db_uri: str | None = None,
     quack_token: str | None = None,
 ) -> None:
-    resolved_path = _resolve_database_path(database_path, db_uri=db_uri or os.getenv("GRIND_DB_URI"))
+    effective_db_uri = db_uri or os.getenv("GRIND_DB_URI")
+    effective_quack_token = quack_token or os.getenv("GRIND_DB_TOKEN")
+    if (
+        effective_db_uri
+        and effective_db_uri.startswith("quack:")
+        and is_local_quack_uri(effective_db_uri)
+        and not effective_quack_token
+    ):
+        ensure_local_quack_server(database_path, effective_db_uri)
+        return
+
+    resolved_path = _resolve_database_path(database_path, db_uri=effective_db_uri)
     resolved_path.parent.mkdir(parents=True, exist_ok=True)
 
     connection = _open_connection(database_path, db_uri=db_uri, quack_token=quack_token)

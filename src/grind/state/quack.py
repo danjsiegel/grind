@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 from pathlib import Path
+import re
 import signal
 import subprocess
 import sys
@@ -38,6 +39,10 @@ def is_local_quack_uri(uri: str) -> bool:
 
 def local_quack_runtime_dir(database_path: Path) -> Path:
     return database_path.parent.parent / "quack"
+
+
+def local_quack_database_path(database_path: Path) -> Path:
+    return local_quack_runtime_dir(database_path) / "grind-quack.duckdb"
 
 
 def ensure_local_quack_server(
@@ -161,7 +166,7 @@ def quack_connect(uri: str, token: str) -> duckdb.DuckDBPyConnection:
     try:
         uri_sql = _sql_literal(uri)
         token_sql = _sql_literal(token)
-        connection.execute("LOAD quack")
+        _load_or_install_quack(connection)
         connection.execute(
             f"CREATE SECRET (TYPE quack, TOKEN '{token_sql}', SCOPE '{uri_sql}')"
         )
@@ -174,9 +179,19 @@ def quack_connect(uri: str, token: str) -> duckdb.DuckDBPyConnection:
     return connection
 
 
+def _load_or_install_quack(connection: duckdb.DuckDBPyConnection) -> None:
+    try:
+        connection.execute("LOAD quack")
+        return
+    except Exception:
+        connection.execute("INSTALL quack")
+        connection.execute("LOAD quack")
+
+
 def serve_local_quack(*, database_path: Path, uri: str, runtime_dir: Path) -> None:
     runtime_dir.mkdir(parents=True, exist_ok=True)
-    database_path.parent.mkdir(parents=True, exist_ok=True)
+    served_database_path = local_quack_database_path(database_path)
+    served_database_path.parent.mkdir(parents=True, exist_ok=True)
     info_path = runtime_dir / "server.json"
     stop_event = threading.Event()
 
@@ -186,17 +201,18 @@ def serve_local_quack(*, database_path: Path, uri: str, runtime_dir: Path) -> No
     signal.signal(signal.SIGTERM, _handle_signal)
     signal.signal(signal.SIGINT, _handle_signal)
 
-    connection = duckdb.connect(str(database_path))
+    connection = duckdb.connect(str(served_database_path))
     try:
         for migration_path in sorted(MIGRATIONS_DIR.glob("V*.sql")):
-            connection.execute(migration_path.read_text(encoding="utf-8"))
-        connection.execute("LOAD quack")
+            connection.execute(_quack_compatible_sql(migration_path.read_text(encoding="utf-8")))
+        _load_or_install_quack(connection)
         row = connection.execute(f"CALL quack_serve('{_sql_literal(uri)}')").fetchone()
         if row is None:
             raise QuackConnectionError(f"quack_serve returned no server details for {uri}")
         info = {
             "pid": os.getpid(),
-            "db_path": str(database_path),
+            "source_db_path": str(database_path),
+            "db_path": str(served_database_path),
             "uri": row[0] if len(row) > 0 else uri,
             "http_url": row[1] if len(row) > 1 else None,
             "auth_token": row[2] if len(row) > 2 else None,
@@ -212,6 +228,22 @@ def serve_local_quack(*, database_path: Path, uri: str, runtime_dir: Path) -> No
                 info_path.unlink()
         finally:
             connection.close()
+
+
+def _quack_compatible_sql(sql: str) -> str:
+    sql = re.sub(
+        r"\s+REFERENCES\s+[A-Za-z_][A-Za-z0-9_]*\s*\([A-Za-z_][A-Za-z0-9_]*\)",
+        "",
+        sql,
+    )
+    sql = re.sub(r"\s+DEFAULT\s+now\(\)", "", sql, flags=re.IGNORECASE)
+    sql = re.sub(
+        r"INSERT INTO schema_version \(version, description\)\s+SELECT\s+([^,]+),\s*([^\n]+)",
+        r"INSERT INTO schema_version (version, applied_at, description)\nSELECT \1, now(), \2",
+        sql,
+        flags=re.IGNORECASE,
+    )
+    return sql
 
 
 def _build_parser() -> argparse.ArgumentParser:

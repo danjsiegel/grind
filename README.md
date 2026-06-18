@@ -83,10 +83,10 @@ uv run --project /path/to/grind grind verify-backend --cwd /path/to/target-repo 
 uv run --project /path/to/grind grind run --cwd /path/to/target-repo "your objective here"
 ```
 
-Optional, for remote DuckDB transport experiments over Quack (preview; current upstream docs use `core_nightly`):
+Optional, for remote DuckDB transport experiments over Quack:
 
 ```bash
-uv run python -c "import duckdb; conn=duckdb.connect(); conn.execute('INSTALL quack FROM core_nightly;'); conn.execute('LOAD quack;')"
+uv run python -c "import duckdb; conn=duckdb.connect(); conn.execute('INSTALL quack'); conn.execute('LOAD quack;')"
 ```
 
 ---
