@@ -139,12 +139,27 @@ def extract_text_output(stdout: str) -> str:
     if parsed is None:
         embedded = _extract_embedded_json_candidate(stripped)
         if embedded is not None:
-            parsed = _parse_direct_json_maybe(embedded)
+            embedded_parsed = _parse_direct_json_maybe(embedded)
+            # Only treat embedded JSON as the full parsed response when it looks
+            # like a substantive reply (has response keys), not a small code snippet
+            # accidentally picked up from source code the model read during analysis.
+            if isinstance(embedded_parsed, dict) and any(
+                k in embedded_parsed for k in ("plan", "summary", "findings", "output_text", "text", "content")
+            ):
+                parsed = embedded_parsed
     if parsed is None:
         parsed = _parse_json_maybe(stripped)
     if parsed is None:
+        mixed_event_stream_text = _extract_event_stream_text_from_mixed_output(stripped)
+        if mixed_event_stream_text:
+            return mixed_event_stream_text
         return stripped
 
+    event_stream_text = _extract_event_stream_text(parsed)
+    if event_stream_text:
+        return event_stream_text
+
+    # Try direct text-value extraction (catches standalone {"plan":...} dicts in the list)
     extracted = _extract_text_values(parsed)
     if extracted:
         return "\n".join(part for part in extracted if part.strip()).strip()
@@ -273,6 +288,83 @@ def _extract_text_values(value: Any) -> list[str]:
                 output.extend(_extract_text_values(value[key]))
         return output
     return []
+
+
+def _extract_event_stream_text(parsed: Any) -> str:
+    if not isinstance(parsed, list):
+        return ""
+
+    # First priority: standalone {"plan":...} objects in the event list (Kilo instant format)
+    for item in parsed:
+        if isinstance(item, dict) and "plan" in item and "type" not in item:
+            plan = item.get("plan")
+            if isinstance(plan, str) and plan.strip():
+                return plan.strip()
+
+    text_candidates: list[str] = []
+    last_plan = ""
+    for item in parsed:
+        if not isinstance(item, dict):
+            continue
+        part = item.get("part")
+        if not isinstance(part, dict):
+            continue
+
+        part_type = part.get("type")
+        if part_type == "text":
+            text = part.get("text")
+            if isinstance(text, str) and text.strip():
+                plan = _extract_plan_from_text_candidate(text)
+                if plan:
+                    last_plan = plan
+                text_candidates.append(text.strip())
+
+    if last_plan:
+        return last_plan
+    if text_candidates:
+        return text_candidates[-1]
+    return ""
+
+
+def _extract_event_stream_text_from_mixed_output(payload: str) -> str:
+    parsed_lines: list[Any] = []
+    for line in payload.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        parsed_line = _parse_direct_json_maybe(stripped)
+        if parsed_line is not None:
+            parsed_lines.append(parsed_line)
+    if not parsed_lines:
+        return ""
+    return _extract_event_stream_text(parsed_lines)
+
+
+def _extract_plan_from_text_candidate(text: str) -> str:
+    embedded = _extract_embedded_json_candidate(text)
+    if embedded is not None:
+        parsed_embedded = _parse_direct_json_maybe(embedded)
+        if isinstance(parsed_embedded, dict):
+            plan = parsed_embedded.get("plan")
+            if isinstance(plan, str) and plan.strip():
+                return plan.strip()
+
+    decoder = json.JSONDecoder()
+    for marker in ("{\"plan\":", "{"):
+        start = text.find(marker)
+        if start == -1:
+            continue
+        candidate = text[start:].strip()
+        try:
+            parsed_candidate, _ = decoder.raw_decode(candidate)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(parsed_candidate, dict):
+            plan = parsed_candidate.get("plan")
+            if isinstance(plan, str) and plan.strip():
+                return plan.strip()
+
+    return ""
 
 
 def _extract_provider_metadata(provider: str, stdout: str) -> dict[str, Any]:

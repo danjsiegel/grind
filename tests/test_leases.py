@@ -88,7 +88,7 @@ def test_lease_conflict_hold(tmp_path: Path, monkeypatch) -> None:
 
     monkeypatch.setattr(
         "grind.engine.orchestrator.invoke_text_prompt",
-        lambda profile, *, prompt, cwd: ModelInvocationResult(
+        lambda profile, *, prompt, cwd, timeout_seconds=300: ModelInvocationResult(
             command=["fake-planner"],
             stdout='{"plan":"ship it"}',
             stderr="",
@@ -213,7 +213,7 @@ def test_worker_heartbeat_during_long_stage(tmp_path: Path, monkeypatch) -> None
     database_path = tmp_path / ".grind" / "state" / "grind.duckdb"
     observations: dict[str, object] = {}
 
-    def fake_invoke_text_prompt(profile, *, prompt: str, cwd: Path) -> ModelInvocationResult:
+    def fake_invoke_text_prompt(profile, *, prompt: str, cwd: Path, timeout_seconds: int = 300) -> ModelInvocationResult:
         with open_state_store(database_path) as store:
             first_seen = store.workers.get(orchestrator.worker_id)
             assert first_seen is not None
@@ -240,7 +240,7 @@ def test_resume_after_hold_allows_worker_handoff(tmp_path: Path, monkeypatch) ->
 
     monkeypatch.setattr(
         "grind.engine.orchestrator.invoke_text_prompt",
-        lambda profile, *, prompt, cwd: ModelInvocationResult(
+        lambda profile, *, prompt, cwd, timeout_seconds=300: ModelInvocationResult(
             command=["fake-planner"],
             stdout='{"plan":"ship it"}',
             stderr="",
@@ -293,7 +293,7 @@ def test_resume_recovers_interrupted_doing_without_active_lease(tmp_path: Path, 
 
     monkeypatch.setattr(
         "grind.engine.orchestrator.invoke_text_prompt",
-        lambda profile, *, prompt, cwd: ModelInvocationResult(
+        lambda profile, *, prompt, cwd, timeout_seconds=300: ModelInvocationResult(
             command=["fake-planner"],
             stdout='{"plan":"ship it"}',
             stderr="",

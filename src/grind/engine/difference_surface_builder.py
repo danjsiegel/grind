@@ -217,10 +217,20 @@ def _git_touched_files(cwd: Path, *, scope_excludes: Sequence[str] = ()) -> list
         candidate = line[3:].strip()
         if not candidate:
             continue
-        path = Path(candidate)
-        if _is_excluded(path, scope_excludes=scope_excludes):
-            continue
-        touched_files.append(candidate)
+        # git status --short encodes renames as "old -> new"; extract both paths so
+        # neither the old name nor the new name is silently dropped.
+        if " -> " in candidate:
+            parts = candidate.split(" -> ", 1)
+        else:
+            parts = [candidate]
+        for part in parts:
+            part = part.strip()
+            if not part:
+                continue
+            path = Path(part)
+            if _is_excluded(path, scope_excludes=scope_excludes):
+                continue
+            touched_files.append(part)
     return sorted(set(touched_files))
 
 

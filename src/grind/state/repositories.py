@@ -447,6 +447,16 @@ class ArtifactRepository:
         ).fetchall()
         return [_artifact_from_row(row) for row in rows]
 
+    def list_all(self) -> list[ArtifactRecord]:
+        rows = self.connection.execute(
+            """
+            SELECT artifact_id, run_id, artifact_type, path, storage_kind, checksum,
+                   size_bytes, created_at, metadata
+            FROM artifacts ORDER BY created_at ASC
+            """
+        ).fetchall()
+        return [_artifact_from_row(row) for row in rows]
+
     def get(self, artifact_id: str) -> ArtifactRecord | None:
         row = self.connection.execute(
             """
@@ -459,6 +469,12 @@ class ArtifactRepository:
         if row is None:
             return None
         return _artifact_from_row(row)
+
+    def update_path(self, artifact_id: str, *, path: str) -> None:
+        self.connection.execute(
+            "UPDATE artifacts SET path = ? WHERE artifact_id = ?",
+            [path, artifact_id],
+        )
 
 
 class TransitionRepository:

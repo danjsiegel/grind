@@ -8,6 +8,7 @@ from decimal import Decimal
 import json
 import os
 from pathlib import Path
+import re
 import secrets
 import socket
 
@@ -64,7 +65,7 @@ from grind.policy.models import PolicyPack, ValidationCommandSpec
 from grind.providers import ModelInvocationError, ModelInvocationResult, extract_json_output, extract_text_output, invoke_text_prompt
 from grind.retrieval import LanceDBRetrievalService
 from grind.state import bootstrap_state_store, open_state_store
-from grind.state.quack import QuackConnectionError
+from grind.state.quack import QuackConnectionError, ensure_local_quack_server, is_local_quack_uri
 from grind.validation import ValidationExecutionResult, run_validation_commands
 from grind.validation.safety import ValidationCommandError, classify_command, normalize_shell_free_command
 
@@ -120,6 +121,26 @@ def _sanitize_planning_text(text: str) -> str:
     return cleaned[:cut_at].strip()
 
 
+def _looks_like_planning_transcript_noise(text: str) -> bool:
+    cleaned = text.strip()
+    if not cleaned:
+        return False
+    if cleaned.startswith('{"type":"tool_use"') or cleaned.startswith('{"type":"step_start"'):
+        return True
+
+    lines = cleaned.splitlines()
+    numbered_lines = sum(1 for line in lines if re.match(r"^\d+:\s", line))
+    if numbered_lines >= 8 and any(marker in cleaned for marker in ("def ", "class ", "<content>", "callID", "sessionID")):
+        return True
+    if cleaned.startswith('"):' ) and numbered_lines >= 5:
+        return True
+    return False
+
+
+def _is_generic_planning_fallback(text: str) -> bool:
+    return text.strip() == "Planner response persisted for operator review."
+
+
 def _planning_response_text(result: ModelInvocationResult | None, fallback: str) -> str:
     if result is not None:
         extracted = extract_text_output(result.stdout)
@@ -127,9 +148,10 @@ def _planning_response_text(result: ModelInvocationResult | None, fallback: str)
             stripped_stdout = result.stdout.strip()
             if extracted.strip() != stripped_stdout:
                 sanitized = _sanitize_planning_text(extracted)
-                if sanitized:
+                if sanitized and not _looks_like_planning_transcript_noise(sanitized):
                     return sanitized
-                return extracted.strip()
+                if not _looks_like_planning_transcript_noise(extracted):
+                    return extracted.strip()
 
         stripped_stdout = result.stdout.strip()
         if stripped_stdout:
@@ -152,15 +174,19 @@ def _planning_response_text(result: ModelInvocationResult | None, fallback: str)
 
             if extracted.strip():
                 sanitized = _sanitize_planning_text(extracted)
-                if sanitized:
+                if sanitized and not _looks_like_planning_transcript_noise(sanitized):
                     return sanitized
-                return extracted.strip()
+                if not _looks_like_planning_transcript_noise(extracted):
+                    return extracted.strip()
         if result.stderr.strip():
             sanitized = _sanitize_planning_text(result.stderr)
-            return sanitized or result.stderr.strip()
+            if sanitized and not _looks_like_planning_transcript_noise(sanitized):
+                return sanitized
+            if not _looks_like_planning_transcript_noise(result.stderr):
+                return result.stderr.strip()
 
     fallback = _sanitize_planning_text(fallback)
-    if fallback:
+    if fallback and not _looks_like_planning_transcript_noise(fallback) and not _is_generic_planning_fallback(fallback):
         return fallback
     return "Planner returned no reviewable text."
 
@@ -346,17 +372,22 @@ class MinimalOrchestrator:
         self.config = load_engine_config(self.config_path)
         self.database_path = self.config.state_path(cwd)
         self.db_uri = self.config.state_db_uri()
+        self.quack_token = os.getenv("GRIND_DB_TOKEN")
         if self.config.state.require_quack and not (self.db_uri and self.db_uri.startswith("quack:")):
             raise QuackConnectionError(
                 "Quack is required by configuration for this workspace; set state.db_uri or GRIND_DB_URI to a quack: URI"
             )
+        if self.db_uri and self.db_uri.startswith("quack:") and is_local_quack_uri(self.db_uri):
+            # For local Quack, always resolve the current token from the running
+            # server rather than trusting a potentially stale GRIND_DB_TOKEN env var.
+            self.quack_token = ensure_local_quack_server(self.database_path, self.db_uri)
         self.artifacts_root = self.config.artifacts_root(cwd)
         self.worker_id = f"worker_{socket.gethostname()}_{os.getpid()}_{secrets.token_hex(4)}"
         self.lease_heartbeat_interval_seconds = 1.0
         self._policy_cache: dict[Path, PolicyPack] = {}
         self.policy_pack = self._load_policy_pack(self._resolve_policy_pack_path(policy_pack_path))
 
-        bootstrap_state_store(self.database_path, db_uri=self.db_uri)
+        bootstrap_state_store(self.database_path, db_uri=self.db_uri, quack_token=self.quack_token)
         self.artifact_store = LocalArtifactStore(self.artifacts_root)
         self.retrieval_service = (
             LanceDBRetrievalService(cwd=cwd, config=self.config)
@@ -366,7 +397,7 @@ class MinimalOrchestrator:
         self._register_worker()
 
     def _open_store(self):
-        return open_state_store(self.database_path, db_uri=self.db_uri)
+        return open_state_store(self.database_path, db_uri=self.db_uri, quack_token=self.quack_token)
 
     def _resolve_policy_pack_path(self, policy_pack_path: Path | None) -> Path | None:
         if policy_pack_path is not None:
@@ -551,7 +582,7 @@ class MinimalOrchestrator:
 
             with self._lease_guard(store, run_id):
                 try:
-                    planning_result = invoke_text_prompt(planner, prompt=planning_prompt, cwd=self.cwd)
+                    planning_result = invoke_text_prompt(planner, prompt=planning_prompt, cwd=self.cwd, timeout_seconds=planner.timeout_seconds)
                     planning_status = StageStatus.COMPLETED
                     planning_summary = "Planner response persisted for operator review."
                 except ModelInvocationError as error:
@@ -1477,7 +1508,7 @@ class MinimalOrchestrator:
             )
 
             try:
-                planning_result = invoke_text_prompt(planner, prompt=planning_prompt, cwd=self.cwd)
+                planning_result = invoke_text_prompt(planner, prompt=planning_prompt, cwd=self.cwd, timeout_seconds=planner.timeout_seconds)
                 planning_status = StageStatus.COMPLETED
                 planning_summary = "Planner response persisted for operator review."
             except ModelInvocationError as error:
@@ -1775,7 +1806,7 @@ class MinimalOrchestrator:
         store.stages.create(stage)
 
         try:
-            result = invoke_text_prompt(implementer, prompt=prompt, cwd=self.cwd)
+            result = invoke_text_prompt(implementer, prompt=prompt, cwd=self.cwd, timeout_seconds=implementer.timeout_seconds)
             self._record_model_call(
                 store=store,
                 run_id=run.run_id,
@@ -1869,7 +1900,7 @@ class MinimalOrchestrator:
         store.stages.create(stage)
 
         try:
-            result = invoke_text_prompt(implementer, prompt=prompt, cwd=self.cwd)
+            result = invoke_text_prompt(implementer, prompt=prompt, cwd=self.cwd, timeout_seconds=implementer.timeout_seconds)
             self._record_model_call(
                 store=store,
                 run_id=run.run_id,
@@ -2469,7 +2500,7 @@ class MinimalOrchestrator:
         store.stages.create(stage)
 
         try:
-            result = invoke_text_prompt(checker, prompt=prompt, cwd=self.cwd)
+            result = invoke_text_prompt(checker, prompt=prompt, cwd=self.cwd, timeout_seconds=checker.timeout_seconds)
             self._record_model_call(
                 store=store,
                 run_id=run.run_id,
@@ -2625,7 +2656,7 @@ class MinimalOrchestrator:
         store.stages.create(stage)
 
         try:
-            result = invoke_text_prompt(adjudicator, prompt=prompt, cwd=self.cwd)
+            result = invoke_text_prompt(adjudicator, prompt=prompt, cwd=self.cwd, timeout_seconds=adjudicator.timeout_seconds)
             self._record_model_call(
                 store=store,
                 run_id=run.run_id,
@@ -2764,7 +2795,7 @@ class MinimalOrchestrator:
             )
             store.artifacts.create(prompt_artifact)
             try:
-                result = invoke_text_prompt(adjudicator, prompt=prompt, cwd=self.cwd)
+                result = invoke_text_prompt(adjudicator, prompt=prompt, cwd=self.cwd, timeout_seconds=adjudicator.timeout_seconds)
                 self._record_model_call(
                     store=store,
                     run_id=run.run_id,

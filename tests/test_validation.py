@@ -18,8 +18,29 @@ def test_normalize_shell_free_command_rejects_shell_metacharacters() -> None:
         normalize_shell_free_command("uv run pytest tests -q && echo nope")
 
 
+def test_normalize_shell_free_command_rejects_dollar_substitution() -> None:
+    with pytest.raises(ValueError, match="shell metacharacters"):
+        normalize_shell_free_command("echo $(id)")
+
+
+def test_normalize_shell_free_command_rejects_backtick_substitution() -> None:
+    with pytest.raises(ValueError, match="shell metacharacters"):
+        normalize_shell_free_command("echo `id`")
+
+
 def test_forbidden_command_is_classified_risky() -> None:
     assert classify_command(["git", "reset", "--hard"]) == "risky"
+
+
+def test_classify_command_does_not_flag_force_with_lease_as_risky() -> None:
+    # '--force-with-lease' starts with '--force' but is not a destructive forced push.
+    assert classify_command(["git", "push", "--force-with-lease"]) == "safe"
+    assert classify_command(["git", "push", "--force-with-lease=origin/main"]) == "safe"
+
+
+def test_classify_command_still_flags_bare_force_push_as_risky() -> None:
+    assert classify_command(["git", "push", "--force"]) == "risky"
+    assert classify_command(["git", "push", "--force", "origin", "main"]) == "risky"
 
 
 def test_run_validation_commands_enforces_timeout(tmp_path: Path) -> None:
@@ -45,6 +66,7 @@ def test_artifact_store_uses_relative_paths_and_verifies_checksum(tmp_path: Path
     )
 
     assert not Path(artifact.path).is_absolute()
+    assert artifact.path.startswith("run_1/")
     assert store.read_text(artifact) == "hello\n"
 
     store.resolve_path(artifact).write_text("tampered\n", encoding="utf-8")
@@ -57,7 +79,7 @@ def test_risky_validation_command_is_held_before_execution(tmp_path: Path, monke
     init_engine_workspace(tmp_path)
     monkeypatch.setattr(
         "grind.engine.orchestrator.invoke_text_prompt",
-        lambda profile, *, prompt, cwd: ModelInvocationResult(
+        lambda profile, *, prompt, cwd, timeout_seconds=300: ModelInvocationResult(
             command=["fake-planner"],
             stdout='{"plan":"ship it"}',
             stderr="",

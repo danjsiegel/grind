@@ -74,6 +74,7 @@ class ModelProfileConfig(BaseModel):
     model: str = Field(min_length=1)
     agent: str | None = None
     variant: str | None = None
+    timeout_seconds: int = Field(default=300, ge=30)
 
 
 def default_model_profiles() -> dict[str, ModelProfileConfig]:

@@ -2,10 +2,11 @@ from __future__ import annotations
 
 from decimal import Decimal
 from pathlib import Path
+from unittest.mock import patch
 
 from grind.artifacts import LocalArtifactStore
 from grind.engine.checkpoints import capture_workspace_snapshot
-from grind.engine.difference_surface_builder import build_difference_surface
+from grind.engine.difference_surface_builder import _git_touched_files, build_difference_surface
 from grind.models import Run, Task, TaskSourceKind, TaskStatus
 from grind.validation import ValidationExecutionResult
 
@@ -82,3 +83,31 @@ def test_build_difference_surface_uses_authoritative_workspace_delta(tmp_path: P
     ]
     assert result.surface.policy_delta["max_iterations"] == 4
     assert result.surface.validation_delta["stop_on_failure"] is True
+
+
+def test_git_touched_files_handles_rename_entries(tmp_path: Path) -> None:
+    # git status --short represents renames as "R  old.py -> new.py".
+    # Both the old name and the new name should appear in touched_files.
+    fake_stdout = "R  src/old_module.py -> src/new_module.py\nM  src/other.py\n"
+
+    with patch(
+        "grind.engine.difference_surface_builder.subprocess.run",
+        return_value=type("R", (), {"returncode": 0, "stdout": fake_stdout})(),
+    ):
+        touched = _git_touched_files(tmp_path)
+
+    assert "src/old_module.py" in touched
+    assert "src/new_module.py" in touched
+    assert "src/other.py" in touched
+
+
+def test_git_touched_files_handles_plain_entries(tmp_path: Path) -> None:
+    fake_stdout = "M  src/foo.py\n?? src/bar.py\n"
+
+    with patch(
+        "grind.engine.difference_surface_builder.subprocess.run",
+        return_value=type("R", (), {"returncode": 0, "stdout": fake_stdout})(),
+    ):
+        touched = _git_touched_files(tmp_path)
+
+    assert touched == ["src/bar.py", "src/foo.py"]

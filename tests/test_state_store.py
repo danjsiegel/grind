@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from decimal import Decimal
+import json
 from pathlib import Path
 
 import duckdb
@@ -34,6 +35,7 @@ from grind.models import (
 from grind.models.artifact import ArtifactRecord
 from grind.models.transition import TransitionRecord
 from grind.state import bootstrap_state_store, current_schema_version, open_state_store
+from grind.state.quack import ensure_local_quack_server
 
 
 def test_bootstrap_state_store_creates_database_and_schema(tmp_path: Path) -> None:
@@ -282,6 +284,11 @@ def test_bootstrap_state_store_can_route_through_quack_connection(tmp_path: Path
 
     monkeypatch.setenv("GRIND_DB_URI", "quack:localhost")
     monkeypatch.setenv("GRIND_DB_TOKEN", "test-token")
+    def fake_ensure_local_quack_server(path, uri):
+        bootstrap_state_store(remote_path, db_uri=str(remote_path))
+        return "test-token"
+
+    monkeypatch.setattr("grind.state.store.ensure_local_quack_server", fake_ensure_local_quack_server)
     monkeypatch.setattr(
         "grind.state.store.quack_connect",
         lambda uri, token: duckdb.connect(str(remote_path)),
@@ -323,3 +330,52 @@ def test_open_state_store_auto_starts_local_quack_when_token_missing(tmp_path: P
         ).fetchone()
 
     assert row == (7,)
+
+
+def test_bootstrap_state_store_skips_migrations_for_local_quack_when_token_present(tmp_path: Path, monkeypatch) -> None:
+    database_path = tmp_path / ".grind" / "state" / "grind.duckdb"
+    calls: list[tuple[Path, str]] = []
+
+    monkeypatch.setenv("GRIND_DB_URI", "quack:localhost")
+    monkeypatch.setenv("GRIND_DB_TOKEN", "test-token")
+    monkeypatch.setattr(
+        "grind.state.store.ensure_local_quack_server",
+        lambda path, uri: calls.append((path, uri)) or "auto-token",
+    )
+    monkeypatch.setattr(
+        "grind.state.store.quack_connect",
+        lambda uri, token: (_ for _ in ()).throw(AssertionError("bootstrap should not open a Quack connection")),
+    )
+
+    bootstrap_state_store(database_path)
+
+    assert calls == [(database_path, "quack:localhost")]
+
+
+def test_ensure_local_quack_server_reuses_relative_source_db_path(tmp_path: Path, monkeypatch) -> None:
+    database_path = tmp_path / ".grind" / "state" / "grind.duckdb"
+    runtime_dir = database_path.parent.parent / "quack"
+    runtime_dir.mkdir(parents=True, exist_ok=True)
+    info_path = runtime_dir / "server.json"
+    info_path.write_text(
+        json.dumps(
+            {
+                "pid": 123,
+                "uri": "quack:localhost",
+                "source_db_path": ".grind/state/grind.duckdb",
+                "auth_token": "relative-token",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("grind.state.quack._pid_is_running", lambda pid: True)
+    monkeypatch.setattr(
+        "grind.state.quack.subprocess.Popen",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("should not restart local Quack helper")),
+    )
+
+    token = ensure_local_quack_server(database_path, "quack:localhost")
+
+    assert token == "relative-token"

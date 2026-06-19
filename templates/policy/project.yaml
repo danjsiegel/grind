@@ -12,6 +12,7 @@ safe_paths:
 
 scope_rules:
   exclude:
+    - ".kilo/"
     - ".venv/"
     - "*.lock"
     - ".grind/"

@@ -11,7 +11,7 @@ from grind.models import OperatorActionType
 from grind.providers import ModelInvocationResult
 from grind.retrieval import LanceDBRetrievalService
 from grind.retrieval.embeddings import EmbeddingBatchResult
-from grind.state import open_state_store
+from grind.state import bootstrap_state_store, open_state_store
 from grind.validation import ValidationExecutionResult
 from grind.verification.models import (
     ProbeKind,
@@ -144,7 +144,7 @@ def test_init_writes_default_engine_yaml(tmp_path: Path, capsys) -> None:
     assert "path: .grind/state/lancedb" in content
     assert "keep_last_terminal_runs:" in content
     assert "validation:" in content
-    assert "schema version: 6" in captured.out
+    assert "schema version: 7" in captured.out
 
 
 def test_init_refuses_to_overwrite_existing_config(tmp_path: Path, capsys) -> None:
@@ -162,7 +162,7 @@ def test_init_refuses_to_overwrite_existing_config(tmp_path: Path, capsys) -> No
 def test_run_uses_default_engine_config_when_missing(tmp_path: Path, monkeypatch, capsys) -> None:
     monkeypatch.setattr(
         "grind.engine.orchestrator.invoke_text_prompt",
-        lambda profile, *, prompt, cwd: ModelInvocationResult(
+        lambda profile, *, prompt, cwd, timeout_seconds=300: ModelInvocationResult(
             command=["fake-planner", "--json"],
             stdout='{"plan":"review this objective"}',
             stderr="",
@@ -182,7 +182,7 @@ def test_run_uses_default_engine_config_when_missing(tmp_path: Path, monkeypatch
 def test_run_plain_text_surfaces_plan_review_guidance(tmp_path: Path, monkeypatch, capsys) -> None:
     monkeypatch.setattr(
         "grind.engine.orchestrator.invoke_text_prompt",
-        lambda profile, *, prompt, cwd: ModelInvocationResult(
+        lambda profile, *, prompt, cwd, timeout_seconds=300: ModelInvocationResult(
             command=["fake-planner", "--json"],
             stdout='{"plan":"review this objective"}',
             stderr="",
@@ -207,7 +207,7 @@ def test_run_plain_text_surfaces_plan_review_guidance(tmp_path: Path, monkeypatc
 def test_run_json_includes_plan_review_hold_context(tmp_path: Path, monkeypatch, capsys) -> None:
     monkeypatch.setattr(
         "grind.engine.orchestrator.invoke_text_prompt",
-        lambda profile, *, prompt, cwd: ModelInvocationResult(
+        lambda profile, *, prompt, cwd, timeout_seconds=300: ModelInvocationResult(
             command=["fake-planner", "--json"],
             stdout='{"plan":"review this objective"}',
             stderr="",
@@ -259,7 +259,7 @@ Could you provide the next thinking that needs to be rewritten?
 
     monkeypatch.setattr(
         "grind.engine.orchestrator.invoke_text_prompt",
-        lambda profile, *, prompt, cwd: ModelInvocationResult(
+        lambda profile, *, prompt, cwd, timeout_seconds=300: ModelInvocationResult(
             command=["fake-planner", "--json"],
             stdout=noisy_response,
             stderr="",
@@ -308,7 +308,7 @@ Only continue if validation stays green.
 
     monkeypatch.setattr(
         "grind.engine.orchestrator.invoke_text_prompt",
-        lambda profile, *, prompt, cwd: ModelInvocationResult(
+        lambda profile, *, prompt, cwd, timeout_seconds=300: ModelInvocationResult(
             command=["fake-planner", "--json"],
             stdout=noisy_response,
             stderr="",
@@ -331,10 +331,57 @@ Only continue if validation stays green.
     assert planner_response.strip() == plan.strip()
 
 
+def test_run_json_rejects_transcript_code_dump_as_plan(tmp_path: Path, monkeypatch, capsys) -> None:
+    noisy_response = """
+"):
+167:         if marker in cleaned:
+168:             cleaned = cleaned.split(marker, 1)[1].strip()
+169:
+170:     lines = cleaned.splitlines()
+171:     first_heading = next((index for index, line in enumerate(lines) if line.startswith(\"#\")), None)
+172:     if first_heading is not None:
+173:         cleaned = \"\\n\".join(lines[first_heading:]).strip()
+174:
+175:     cut_markers = (
+176:         \"\\n## Operator Actions\",
+177:         \"\\nNow I have all the context I need.\",
+178:         \"\\nI notice the current rewritten thinking\",
+179:         \"\\nCould you provide the next thinking\",
+180:     )
+181:     cut_at = len(cleaned)
+182:     for marker in cut_markers:
+183:         index = cleaned.find(marker)
+184:         if index != -1:
+185:             cut_at = min(cut_at, index)
+186:     return cleaned[:cut_at].strip()
+""".strip()
+
+    monkeypatch.setattr(
+        "grind.engine.orchestrator.invoke_text_prompt",
+        lambda profile, *, prompt, cwd, timeout_seconds=300: ModelInvocationResult(
+            command=["fake-planner", "--json"],
+            stdout=noisy_response,
+            stderr="",
+            returncode=0,
+        ),
+    )
+
+    exit_code = main(["run", "ship it", "--cwd", str(tmp_path), "--json"])
+    payload = json.loads(capsys.readouterr().out)
+
+    assert exit_code == 0
+
+    plan_review = Path(payload["review_paths"]["plan"]).read_text()
+    planner_response = Path(payload["review_paths"]["planner_response"]).read_text()
+
+    assert "Planner returned no reviewable text." in plan_review
+    assert planner_response.strip() == "Planner returned no reviewable text."
+
+
 def test_prune_removes_old_terminal_runs_and_artifacts(tmp_path: Path, monkeypatch, capsys) -> None:
     monkeypatch.setattr(
         "grind.engine.orchestrator.invoke_text_prompt",
-        lambda profile, *, prompt, cwd: ModelInvocationResult(
+        lambda profile, *, prompt, cwd, timeout_seconds=300: ModelInvocationResult(
             command=["fake-planner", "--json"],
             stdout='{"plan":"review this objective"}',
             stderr="",
@@ -365,10 +412,13 @@ def test_prune_removes_old_terminal_runs_and_artifacts(tmp_path: Path, monkeypat
         assert store.runs.get(run_ids[2]) is not None
         assert store.runs.get(run_ids[0]) is None
         assert store.runs.get(run_ids[1]) is None
+        latest_artifacts = store.artifacts.list_by_run(run_ids[2])
 
     assert not (tmp_path / ".grind" / "artifacts" / run_ids[0]).exists()
     assert not (tmp_path / ".grind" / "artifacts" / run_ids[1]).exists()
-    assert (tmp_path / ".grind" / "artifacts" / run_ids[2]).exists()
+    assert latest_artifacts
+    assert all((tmp_path / ".grind" / "artifacts" / artifact.path).exists() for artifact in latest_artifacts)
+    assert all(artifact.path.startswith(f"{run_ids[2]}/") for artifact in latest_artifacts)
 
 
 def test_auto_prune_keeps_only_configured_terminal_runs(tmp_path: Path, monkeypatch, capsys) -> None:
@@ -383,7 +433,7 @@ def test_auto_prune_keeps_only_configured_terminal_runs(tmp_path: Path, monkeypa
 
     monkeypatch.setattr(
         "grind.engine.orchestrator.invoke_text_prompt",
-        lambda profile, *, prompt, cwd: ModelInvocationResult(
+        lambda profile, *, prompt, cwd, timeout_seconds=300: ModelInvocationResult(
             command=["fake-planner", "--json"],
             stdout='{"plan":"review this objective"}',
             stderr="",
@@ -411,10 +461,63 @@ def test_auto_prune_keeps_only_configured_terminal_runs(tmp_path: Path, monkeypa
         assert store.runs.get(run_ids[2]) is not None
         assert store.runs.get(run_ids[0]) is None
         assert store.runs.get(run_ids[1]) is None
+        latest_artifacts = store.artifacts.list_by_run(run_ids[2])
 
     assert not (tmp_path / ".grind" / "artifacts" / run_ids[0]).exists()
     assert not (tmp_path / ".grind" / "artifacts" / run_ids[1]).exists()
-    assert (tmp_path / ".grind" / "artifacts" / run_ids[2]).exists()
+    assert latest_artifacts
+    assert all((tmp_path / ".grind" / "artifacts" / artifact.path).exists() for artifact in latest_artifacts)
+    assert all(artifact.path.startswith(f"{run_ids[2]}/") for artifact in latest_artifacts)
+
+
+def test_auto_prune_skips_quack_transport_delete_failures(tmp_path: Path, monkeypatch, capsys) -> None:
+    main(["init", "--cwd", str(tmp_path)])
+    capsys.readouterr()
+
+    config_path = tmp_path / ".grind" / "engine.yaml"
+    config_data = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    config_data["retention"]["mode"] = "auto"
+    config_data["retention"]["keep_last_terminal_runs"] = 1
+    config_data["state"]["db_uri"] = "quack:localhost"
+    config_path.write_text(yaml.safe_dump(config_data, sort_keys=False), encoding="utf-8")
+
+    remote_path = tmp_path / "remote.duckdb"
+    bootstrap_state_store(remote_path, db_uri=str(remote_path))
+    monkeypatch.setenv("GRIND_DB_TOKEN", "test-token")
+    monkeypatch.setattr(
+        "grind.state.store.ensure_local_quack_server",
+        lambda path, uri: "test-token",
+    )
+    monkeypatch.setattr(
+        "grind.state.store.quack_connect",
+        lambda uri, token: __import__("duckdb").connect(str(remote_path)),
+    )
+
+    monkeypatch.setattr(
+        "grind.cli._terminal_run_ids_to_prune",
+        lambda **kwargs: ["run_old"],
+    )
+    monkeypatch.setattr(
+        "grind.cli._prune_run_ids",
+        lambda **kwargs: (_ for _ in ()).throw(RuntimeError("quack delete broke")),
+    )
+
+    monkeypatch.setattr(
+        "grind.engine.orchestrator.invoke_text_prompt",
+        lambda profile, *, prompt, cwd, timeout_seconds=300: ModelInvocationResult(
+            command=["fake-planner", "--json"],
+            stdout='{"plan":"review this objective"}',
+            stderr="",
+            returncode=0,
+        ),
+    )
+
+    run_exit = main(["run", "ship it", "--cwd", str(tmp_path), "--json"])
+    run_payload = json.loads(capsys.readouterr().out)
+
+    assert run_exit == 0
+    assert run_payload["auto_prune"]["skipped"] is True
+    assert "auto-prune skipped for Quack transport" in run_payload["auto_prune"]["reason"]
 
 
 def test_prune_removes_retrieval_documents_for_pruned_runs(tmp_path: Path, monkeypatch, capsys) -> None:
@@ -424,7 +527,7 @@ def test_prune_removes_retrieval_documents_for_pruned_runs(tmp_path: Path, monke
 
     monkeypatch.setattr(
         "grind.engine.orchestrator.invoke_text_prompt",
-        lambda profile, *, prompt, cwd: ModelInvocationResult(
+        lambda profile, *, prompt, cwd, timeout_seconds=300: ModelInvocationResult(
             command=["fake-planner", "--json"],
             stdout='{"plan":"review this objective"}',
             stderr="",
@@ -462,6 +565,45 @@ def test_prune_removes_retrieval_documents_for_pruned_runs(tmp_path: Path, monke
     assert after_kept.get("run_summaries", 0) > 0
 
 
+def test_cleanup_artifacts_prunes_orphans_without_rewriting_db_paths(tmp_path: Path, monkeypatch, capsys) -> None:
+    monkeypatch.setattr(
+        "grind.engine.orchestrator.invoke_text_prompt",
+        lambda profile, *, prompt, cwd, timeout_seconds=300: ModelInvocationResult(
+            command=["fake-planner", "--json"],
+            stdout='{"plan":"review this objective"}',
+            stderr="",
+            returncode=0,
+        ),
+    )
+
+    run_exit = main(["run", "ship it", "--cwd", str(tmp_path), "--json"])
+    run_payload = json.loads(capsys.readouterr().out)
+    assert run_exit == 0
+
+    database_path = tmp_path / ".grind" / "state" / "grind.duckdb"
+    artifacts_root = tmp_path / ".grind" / "artifacts"
+    with open_state_store(database_path) as store:
+        artifact = store.artifacts.list_by_run(run_payload["run_id"])[0]
+    orphan_path = artifacts_root / "run_legacy" / "orphan.txt"
+    orphan_path.parent.mkdir(parents=True, exist_ok=True)
+    orphan_path.write_text("orphan\n", encoding="utf-8")
+
+    exit_code = main(["cleanup-artifacts", "--cwd", str(tmp_path), "--json"])
+    payload = json.loads(capsys.readouterr().out)
+
+    assert exit_code == 0
+    assert payload["orphan_files_deleted"] >= 1
+
+    with open_state_store(database_path) as store:
+        updated = store.artifacts.get(artifact.artifact_id)
+
+    assert updated is not None
+    assert updated.path == artifact.path
+    assert (artifacts_root / updated.path).exists()
+    assert not orphan_path.exists()
+    assert not orphan_path.parent.exists()
+
+
 def test_run_creates_stored_run_with_real_planner_adapter(tmp_path: Path, monkeypatch, capsys) -> None:
     main(["init", "--cwd", str(tmp_path)])
     capsys.readouterr()
@@ -470,7 +612,7 @@ def test_run_creates_stored_run_with_real_planner_adapter(tmp_path: Path, monkey
 
     monkeypatch.setattr(
         "grind.engine.orchestrator.invoke_text_prompt",
-        lambda profile, *, prompt, cwd: ModelInvocationResult(
+        lambda profile, *, prompt, cwd, timeout_seconds=300: ModelInvocationResult(
             command=["fake-planner", "--json"],
             stdout='{"plan":"review this objective"}',
             stderr="",
@@ -519,7 +661,7 @@ def test_resume_status_findings_and_restore_checkpoint(tmp_path: Path, monkeypat
 
     monkeypatch.setattr(
         "grind.engine.orchestrator.invoke_text_prompt",
-        lambda profile, *, prompt, cwd: _model_response_for_prompt(prompt),
+        lambda profile, *, prompt, cwd, timeout_seconds=300: _model_response_for_prompt(prompt),
     )
 
     run_exit = main(["run", "ship it", "--cwd", str(tmp_path), "--json"])
@@ -588,7 +730,7 @@ def test_resume_can_complete_when_validation_passes(tmp_path: Path, monkeypatch,
 
     monkeypatch.setattr(
         "grind.engine.orchestrator.invoke_text_prompt",
-        lambda profile, *, prompt, cwd: _model_response_for_prompt(prompt),
+        lambda profile, *, prompt, cwd, timeout_seconds=300: _model_response_for_prompt(prompt),
     )
     monkeypatch.setattr(
         "grind.engine.orchestrator.run_validation_commands",
@@ -643,7 +785,7 @@ def test_retrieval_index_search_and_report(tmp_path: Path, monkeypatch, capsys) 
 
     monkeypatch.setattr(
         "grind.engine.orchestrator.invoke_text_prompt",
-        lambda profile, *, prompt, cwd: _model_response_for_prompt(prompt),
+        lambda profile, *, prompt, cwd, timeout_seconds=300: _model_response_for_prompt(prompt),
     )
     monkeypatch.setattr(
         "grind.engine.orchestrator.run_validation_commands",
@@ -757,7 +899,7 @@ def test_retrieval_search_uses_hybrid_local_fallback_without_model(tmp_path: Pat
     )
     monkeypatch.setattr(
         "grind.engine.orchestrator.invoke_text_prompt",
-        lambda profile, *, prompt, cwd: _model_response_for_prompt(prompt),
+        lambda profile, *, prompt, cwd, timeout_seconds=300: _model_response_for_prompt(prompt),
     )
     monkeypatch.setattr(
         "grind.engine.orchestrator.run_validation_commands",
@@ -806,7 +948,7 @@ def test_retrieval_search_falls_back_to_lexical_when_collection_embeddings_are_i
 
     monkeypatch.setattr(
         "grind.engine.orchestrator.invoke_text_prompt",
-        lambda profile, *, prompt, cwd: _model_response_for_prompt(prompt),
+        lambda profile, *, prompt, cwd, timeout_seconds=300: _model_response_for_prompt(prompt),
     )
     monkeypatch.setattr(
         "grind.engine.orchestrator.run_validation_commands",
@@ -933,7 +1075,7 @@ def test_resume_runs_act_stage_before_returning_to_hold_on_persistent_blockers(
 
     monkeypatch.setattr(
         "grind.engine.orchestrator.invoke_text_prompt",
-        lambda profile, *, prompt, cwd: model_response(prompt),
+        lambda profile, *, prompt, cwd, timeout_seconds=300: model_response(prompt),
     )
     monkeypatch.setattr(
         "grind.engine.orchestrator.run_validation_commands",
@@ -1042,7 +1184,7 @@ def test_resume_persists_evidence_verification_for_checker_citations(
 
     monkeypatch.setattr(
         "grind.engine.orchestrator.invoke_text_prompt",
-        lambda profile, *, prompt, cwd: model_response(prompt),
+        lambda profile, *, prompt, cwd, timeout_seconds=300: model_response(prompt),
     )
     monkeypatch.setattr(
         "grind.engine.orchestrator.run_validation_commands",
@@ -1081,7 +1223,7 @@ def test_approve_sets_operator_status_and_patches_limits(tmp_path: Path, monkeyp
 
     monkeypatch.setattr(
         "grind.engine.orchestrator.invoke_text_prompt",
-        lambda profile, *, prompt, cwd: _model_response_for_prompt(prompt),
+        lambda profile, *, prompt, cwd, timeout_seconds=300: _model_response_for_prompt(prompt),
     )
 
     run_exit = main(["run", "ship it", "--cwd", str(tmp_path), "--json"])
@@ -1123,7 +1265,7 @@ def test_abort_transitions_run_to_aborted(tmp_path: Path, monkeypatch, capsys) -
 
     monkeypatch.setattr(
         "grind.engine.orchestrator.invoke_text_prompt",
-        lambda profile, *, prompt, cwd: _model_response_for_prompt(prompt),
+        lambda profile, *, prompt, cwd, timeout_seconds=300: _model_response_for_prompt(prompt),
     )
 
     run_exit = main(["run", "ship it", "--cwd", str(tmp_path), "--json"])
@@ -1151,7 +1293,7 @@ def test_hold_reason_returns_current_operator_hold_reason(tmp_path: Path, monkey
 
     monkeypatch.setattr(
         "grind.engine.orchestrator.invoke_text_prompt",
-        lambda profile, *, prompt, cwd: _model_response_for_prompt(prompt),
+        lambda profile, *, prompt, cwd, timeout_seconds=300: _model_response_for_prompt(prompt),
     )
 
     run_exit = main(["run", "ship it", "--cwd", str(tmp_path), "--json"])
@@ -1183,7 +1325,7 @@ def test_hold_reason_plain_text_surfaces_review_paths(tmp_path: Path, monkeypatc
 
     monkeypatch.setattr(
         "grind.engine.orchestrator.invoke_text_prompt",
-        lambda profile, *, prompt, cwd: _model_response_for_prompt(prompt),
+        lambda profile, *, prompt, cwd, timeout_seconds=300: _model_response_for_prompt(prompt),
     )
 
     run_exit = main(["run", "ship it", "--cwd", str(tmp_path), "--json"])
@@ -1230,7 +1372,7 @@ def test_reject_replans_and_returns_to_plan_review_hold(tmp_path: Path, monkeypa
 
     monkeypatch.setattr(
         "grind.engine.orchestrator.invoke_text_prompt",
-        lambda profile, *, prompt, cwd: model_response(prompt),
+        lambda profile, *, prompt, cwd, timeout_seconds=300: model_response(prompt),
     )
 
     run_exit = main(["run", "ship it", "--cwd", str(tmp_path), "--json"])
@@ -1272,7 +1414,7 @@ def test_resume_persists_model_calls_and_exposes_them_via_inspect(tmp_path: Path
 
     monkeypatch.setattr(
         "grind.engine.orchestrator.invoke_text_prompt",
-        lambda profile, *, prompt, cwd: model_response(prompt),
+        lambda profile, *, prompt, cwd, timeout_seconds=300: model_response(prompt),
     )
     monkeypatch.setattr(
         "grind.engine.orchestrator.run_validation_commands",
@@ -1326,7 +1468,7 @@ def test_semantic_hard_fail_persists_records_before_checker(tmp_path: Path, monk
 
     monkeypatch.setattr(
         "grind.engine.orchestrator.invoke_text_prompt",
-        lambda profile, *, prompt, cwd: model_response(prompt),
+        lambda profile, *, prompt, cwd, timeout_seconds=300: model_response(prompt),
     )
     monkeypatch.setattr(
         "grind.engine.orchestrator.run_validation_commands",
@@ -1421,7 +1563,7 @@ def test_consensus_split_persists_panel_votes_and_holds_run(tmp_path: Path, monk
 
     monkeypatch.setattr(
         "grind.engine.orchestrator.invoke_text_prompt",
-        lambda profile, *, prompt, cwd: model_response(prompt),
+        lambda profile, *, prompt, cwd, timeout_seconds=300: model_response(prompt),
     )
     monkeypatch.setattr(
         "grind.engine.orchestrator.run_validation_commands",
@@ -1466,7 +1608,7 @@ def test_patch_policy_updates_validation_override_and_resume_uses_it(
 
     monkeypatch.setattr(
         "grind.engine.orchestrator.invoke_text_prompt",
-        lambda profile, *, prompt, cwd: _model_response_for_prompt(prompt),
+        lambda profile, *, prompt, cwd, timeout_seconds=300: _model_response_for_prompt(prompt),
     )
 
     def fake_validation_runner(
@@ -1542,7 +1684,7 @@ def test_inspect_lists_and_reads_artifacts(tmp_path: Path, monkeypatch, capsys) 
 
     monkeypatch.setattr(
         "grind.engine.orchestrator.invoke_text_prompt",
-        lambda profile, *, prompt, cwd: _model_response_for_prompt(prompt),
+        lambda profile, *, prompt, cwd, timeout_seconds=300: _model_response_for_prompt(prompt),
     )
 
     run_exit = main(["run", "ship it", "--cwd", str(tmp_path), "--json"])
@@ -1625,7 +1767,7 @@ def test_resume_holds_when_max_iterations_reached(tmp_path: Path, monkeypatch, c
 
     monkeypatch.setattr(
         "grind.engine.orchestrator.invoke_text_prompt",
-        lambda profile, *, prompt, cwd: model_response(prompt),
+        lambda profile, *, prompt, cwd, timeout_seconds=300: model_response(prompt),
     )
     monkeypatch.setattr(
         "grind.engine.orchestrator.run_validation_commands",
@@ -1719,7 +1861,7 @@ def test_resume_holds_when_budget_limit_reached(tmp_path: Path, monkeypatch, cap
 
     monkeypatch.setattr(
         "grind.engine.orchestrator.invoke_text_prompt",
-        lambda profile, *, prompt, cwd: model_response(prompt),
+        lambda profile, *, prompt, cwd, timeout_seconds=300: model_response(prompt),
     )
     monkeypatch.setattr(
         "grind.engine.orchestrator.run_validation_commands",

@@ -115,6 +115,61 @@ Trailing transcript that should not be treated as the plan.
     assert extract_text_output(stdout).strip() == plan.strip()
 
 
+def test_extract_text_output_prefers_final_event_stream_plan_over_tool_transcript() -> None:
+    event_stream = "\n".join(
+        [
+            json.dumps({
+                "type": "tool_use",
+                "part": {
+                    "type": "tool",
+                    "tool": "read",
+                    "state": {"output": "1: def noisy():\\n2: pass"},
+                },
+            }),
+            json.dumps({
+                "type": "text",
+                "part": {
+                    "type": "text",
+                    "text": (
+                        "Now I have a complete picture.\\n\\n"
+                        '{"plan":"## Real Plan\\n\\n1. Run focused tests.\\n2. Stop on first failure."}'
+                    ),
+                },
+            }),
+        ]
+    )
+
+    assert extract_text_output(event_stream) == "## Real Plan\n\n1. Run focused tests.\n2. Stop on first failure."
+
+
+def test_extract_text_output_scans_mixed_output_for_late_plan_event() -> None:
+    mixed_output = "\n".join(
+        [
+            '"):',
+            '167:         if marker in cleaned:',
+            json.dumps({
+                "type": "text",
+                "part": {
+                    "type": "text",
+                    "text": "intermediate noisy text without a plan",
+                },
+            }),
+            json.dumps({
+                "type": "text",
+                "part": {
+                    "type": "text",
+                    "text": (
+                        "Now I have a complete picture.\\n\\n"
+                        '{"plan":"## Final Plan\\n\\n1. Inspect live code.\\n2. Run focused validation."}'
+                    ),
+                },
+            }),
+        ]
+    )
+
+    assert extract_text_output(mixed_output) == "## Final Plan\n\n1. Inspect live code.\n2. Run focused validation."
+
+
 def test_invoke_text_prompt_wraps_timeout_as_model_error(monkeypatch, tmp_path: Path) -> None:
     profile = ModelProfileConfig(provider="kilo_cli", model="qwen-3.6-plus", agent="code")
 

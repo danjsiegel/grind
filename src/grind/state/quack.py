@@ -95,19 +95,22 @@ def ensure_local_quack_server(
     if not is_local_quack_uri(uri):
         raise QuackConnectionError(f"auto-start only supports local Quack URIs, got: {uri}")
 
+    normalized_database_path = database_path.resolve()
     runtime_dir = local_quack_runtime_dir(database_path)
     runtime_dir.mkdir(parents=True, exist_ok=True)
     info_path = runtime_dir / "server.json"
     existing = _read_server_info(info_path)
     if existing is not None:
         existing_pid = int(existing.get("pid", 0))
-        existing_db_path = existing.get("db_path")
+        existing_source_db_path = existing.get("source_db_path") or existing.get("db_path")
+        if isinstance(existing_source_db_path, str):
+            existing_source_db_path = str(Path(existing_source_db_path).resolve())
         if force_restart and _pid_is_running(existing_pid):
             _terminate_pid(existing_pid)
             existing = None
         elif (
             existing.get("uri") == uri
-            and existing_db_path == str(database_path)
+            and existing_source_db_path == str(normalized_database_path)
             and _pid_is_running(existing_pid)
         ):
             token = existing.get("auth_token")
@@ -116,7 +119,7 @@ def ensure_local_quack_server(
 
     log_path = runtime_dir / "server.log"
     with log_path.open("a", encoding="utf-8") as handle:
-        handle.write(f"starting local quack server for {database_path} at {uri}\n")
+        handle.write(f"starting local quack server for {normalized_database_path} at {uri}\n")
 
     process = subprocess.Popen(
         [
@@ -184,7 +187,7 @@ def _terminate_pid(pid: int) -> None:
         return
     try:
         os.killpg(pid, signal.SIGTERM)
-    except ProcessLookupError:
+    except (ProcessLookupError, PermissionError):
         return
     deadline = time.monotonic() + 5.0
     while time.monotonic() < deadline:
@@ -193,7 +196,7 @@ def _terminate_pid(pid: int) -> None:
         time.sleep(0.1)
     try:
         os.killpg(pid, signal.SIGKILL)
-    except ProcessLookupError:
+    except (ProcessLookupError, PermissionError):
         return
 
 
@@ -241,7 +244,13 @@ def quack_connect(uri: str, token: str) -> QuackConnection:
     except Exception as exc:
         connection.close()
         raise QuackConnectionError(f"unable to connect to Quack URI {uri}: {exc}") from exc
-    return QuackConnection(connection=connection, uri=uri, token=token)
+    conn = QuackConnection(connection=connection, uri=uri, token=token)
+    try:
+        conn.execute("SELECT 1")
+    except duckdb.InvalidInputException as exc:
+        connection.close()
+        raise QuackConnectionError(f"Authentication failed for {uri}") from exc
+    return conn
 
 
 def _load_or_install_quack(connection: duckdb.DuckDBPyConnection) -> None:
@@ -276,8 +285,8 @@ def serve_local_quack(*, database_path: Path, uri: str, runtime_dir: Path) -> No
             raise QuackConnectionError(f"quack_serve returned no server details for {uri}")
         info = {
             "pid": os.getpid(),
-            "source_db_path": str(database_path),
-            "db_path": str(served_database_path),
+            "source_db_path": str(database_path.resolve()),
+            "db_path": str(served_database_path.resolve()),
             "uri": row[0] if len(row) > 0 else uri,
             "http_url": row[1] if len(row) > 1 else None,
             "auth_token": row[2] if len(row) > 2 else None,

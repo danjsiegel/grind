@@ -39,6 +39,15 @@ def _open_connection(
         except QuackConnectionError:
             if not is_local_quack_uri(effective_db_uri):
                 raise
+            # Auth failed — the server may have restarted and rotated its token.
+            # Try reading the current token from server.json before resorting to
+            # a force-restart (which requires owning the server process).
+            fresh_token = ensure_local_quack_server(database_path, effective_db_uri)
+            if fresh_token != effective_token:
+                try:
+                    return quack_connect(effective_db_uri, fresh_token)
+                except QuackConnectionError:
+                    pass
             effective_token = ensure_local_quack_server(database_path, effective_db_uri, force_restart=True)
             return quack_connect(effective_db_uri, effective_token)
 
@@ -54,12 +63,10 @@ def bootstrap_state_store(
     quack_token: str | None = None,
 ) -> None:
     effective_db_uri = db_uri or os.getenv("GRIND_DB_URI")
-    effective_quack_token = quack_token or os.getenv("GRIND_DB_TOKEN")
     if (
         effective_db_uri
         and effective_db_uri.startswith("quack:")
         and is_local_quack_uri(effective_db_uri)
-        and not effective_quack_token
     ):
         ensure_local_quack_server(database_path, effective_db_uri)
         return

@@ -87,7 +87,7 @@ safe_paths:
     )
     monkeypatch.setattr(
         "grind.engine.orchestrator.invoke_text_prompt",
-        lambda profile, *, prompt, cwd: ModelInvocationResult(
+        lambda profile, *, prompt, cwd, timeout_seconds=300: ModelInvocationResult(
             command=["fake-planner"],
             stdout='{"plan":"ship it"}',
             stderr="",
@@ -140,7 +140,7 @@ safe_paths:
     captured: dict[str, object] = {}
     monkeypatch.setattr(
         "grind.engine.orchestrator.invoke_text_prompt",
-        lambda profile, *, prompt, cwd: ModelInvocationResult(
+        lambda profile, *, prompt, cwd, timeout_seconds=300: ModelInvocationResult(
             command=["fake-planner"],
             stdout='{"plan":"ship it"}',
             stderr="",
