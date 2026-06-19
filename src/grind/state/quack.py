@@ -10,12 +10,52 @@ import subprocess
 import sys
 import threading
 import time
+from datetime import date, datetime
+from decimal import Decimal
+from typing import Any
 
 import duckdb
 
 
 class QuackConnectionError(RuntimeError):
     pass
+
+
+class QuackCursor:
+    def __init__(self, rows: list[tuple[Any, ...]]):
+        self._rows = rows
+
+    def fetchone(self) -> tuple[Any, ...] | None:
+        if not self._rows:
+            return None
+        return self._rows[0]
+
+    def fetchall(self) -> list[tuple[Any, ...]]:
+        return list(self._rows)
+
+
+class QuackConnection:
+    def __init__(self, *, connection: duckdb.DuckDBPyConnection, uri: str, token: str):
+        self._connection = connection
+        self._uri = uri
+        self._token = token
+        self._disable_ssl = is_local_quack_uri(uri)
+
+    def execute(self, query: str, params: list[Any] | tuple[Any, ...] | None = None) -> QuackCursor:
+        rendered = _render_sql(query, params)
+        wrapper = (
+            "SELECT * FROM quack_query("
+            f"'{_sql_literal(self._uri)}', "
+            f"'{_sql_literal(rendered)}', "
+            f"disable_ssl => {'true' if self._disable_ssl else 'false'}, "
+            f"token => '{_sql_literal(self._token)}'"
+            ")"
+        )
+        rows = self._connection.execute(wrapper).fetchall()
+        return QuackCursor(rows)
+
+    def close(self) -> None:
+        self._connection.close()
 
 
 LOCAL_QUACK_HOSTS = {"localhost", "127.0.0.1", "::1"}
@@ -161,22 +201,47 @@ def _sql_literal(value: str) -> str:
     return value.replace("'", "''")
 
 
-def quack_connect(uri: str, token: str) -> duckdb.DuckDBPyConnection:
+def _render_sql(query: str, params: list[Any] | tuple[Any, ...] | None) -> str:
+    if not params:
+        return query
+
+    pieces = query.split("?")
+    if len(pieces) - 1 != len(params):
+        raise QuackConnectionError(
+            f"parameter count mismatch while rendering SQL for Quack: expected {len(pieces) - 1}, got {len(params)}"
+        )
+
+    rendered = [pieces[0]]
+    for value, suffix in zip(params, pieces[1:]):
+        rendered.append(_value_literal(value))
+        rendered.append(suffix)
+    return "".join(rendered)
+
+
+def _value_literal(value: Any) -> str:
+    if value is None:
+        return "NULL"
+    if isinstance(value, bool):
+        return "TRUE" if value else "FALSE"
+    if isinstance(value, (int, float, Decimal)):
+        return str(value)
+    if isinstance(value, datetime):
+        return f"'{_sql_literal(value.isoformat(sep=' '))}'"
+    if isinstance(value, date):
+        return f"'{_sql_literal(value.isoformat())}'"
+    if isinstance(value, (dict, list, tuple)):
+        return f"'{_sql_literal(json.dumps(value, default=str))}'"
+    return f"'{_sql_literal(str(value))}'"
+
+
+def quack_connect(uri: str, token: str) -> QuackConnection:
     connection = duckdb.connect()
     try:
-        uri_sql = _sql_literal(uri)
-        token_sql = _sql_literal(token)
         _load_or_install_quack(connection)
-        connection.execute(
-            f"CREATE SECRET (TYPE quack, TOKEN '{token_sql}', SCOPE '{uri_sql}')"
-        )
-        connection.execute(f"ATTACH '{uri_sql}' AS grind (TYPE quack)")
-        connection.execute("USE grind")
-        connection.execute("SET schema = 'main'")
     except Exception as exc:
         connection.close()
         raise QuackConnectionError(f"unable to connect to Quack URI {uri}: {exc}") from exc
-    return connection
+    return QuackConnection(connection=connection, uri=uri, token=token)
 
 
 def _load_or_install_quack(connection: duckdb.DuckDBPyConnection) -> None:
