@@ -587,7 +587,7 @@ class MinimalOrchestrator:
 
             with self._lease_guard(store, run_id):
                 try:
-                    planning_result = invoke_text_prompt(planner, prompt=planning_prompt, cwd=self.cwd)
+                    planning_result = invoke_text_prompt(planner, prompt=planning_prompt, cwd=self.cwd, timeout_seconds=planner.timeout_seconds)
                     planning_status = StageStatus.COMPLETED
                     planning_summary = "Planner response persisted for operator review."
                 except ModelInvocationError as error:
@@ -1277,7 +1277,7 @@ class MinimalOrchestrator:
             )
 
             try:
-                planning_result = invoke_text_prompt(planner, prompt=planning_prompt, cwd=self.cwd)
+                planning_result = invoke_text_prompt(planner, prompt=planning_prompt, cwd=self.cwd, timeout_seconds=planner.timeout_seconds)
                 planning_status = StageStatus.COMPLETED
                 planning_summary = "Planner response persisted for operator review."
             except ModelInvocationError as error:
@@ -1575,7 +1575,7 @@ class MinimalOrchestrator:
         store.stages.create(stage)
 
         try:
-            result = invoke_text_prompt(implementer, prompt=prompt, cwd=self.cwd)
+            result = invoke_text_prompt(implementer, prompt=prompt, cwd=self.cwd, timeout_seconds=implementer.timeout_seconds)
             self._record_model_call(
                 store=store,
                 run_id=run.run_id,
@@ -1669,7 +1669,7 @@ class MinimalOrchestrator:
         store.stages.create(stage)
 
         try:
-            result = invoke_text_prompt(implementer, prompt=prompt, cwd=self.cwd)
+            result = invoke_text_prompt(implementer, prompt=prompt, cwd=self.cwd, timeout_seconds=implementer.timeout_seconds)
             self._record_model_call(
                 store=store,
                 run_id=run.run_id,
@@ -2269,7 +2269,7 @@ class MinimalOrchestrator:
         store.stages.create(stage)
 
         try:
-            result = invoke_text_prompt(checker, prompt=prompt, cwd=self.cwd)
+            result = invoke_text_prompt(checker, prompt=prompt, cwd=self.cwd, timeout_seconds=checker.timeout_seconds)
             self._record_model_call(
                 store=store,
                 run_id=run.run_id,
@@ -2425,7 +2425,7 @@ class MinimalOrchestrator:
         store.stages.create(stage)
 
         try:
-            result = invoke_text_prompt(adjudicator, prompt=prompt, cwd=self.cwd)
+            result = invoke_text_prompt(adjudicator, prompt=prompt, cwd=self.cwd, timeout_seconds=adjudicator.timeout_seconds)
             self._record_model_call(
                 store=store,
                 run_id=run.run_id,
@@ -2564,7 +2564,7 @@ class MinimalOrchestrator:
             )
             store.artifacts.create(prompt_artifact)
             try:
-                result = invoke_text_prompt(adjudicator, prompt=prompt, cwd=self.cwd)
+                result = invoke_text_prompt(adjudicator, prompt=prompt, cwd=self.cwd, timeout_seconds=adjudicator.timeout_seconds)
                 self._record_model_call(
                     store=store,
                     run_id=run.run_id,
