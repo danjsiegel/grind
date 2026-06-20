@@ -12,7 +12,7 @@ import threading
 import time
 from datetime import date, datetime
 from decimal import Decimal
-from typing import Any
+from typing import Any, Callable
 
 import duckdb
 
@@ -35,15 +35,15 @@ class QuackCursor:
 
 
 class QuackConnection:
-    def __init__(self, *, connection: duckdb.DuckDBPyConnection, uri: str, token: str):
+    def __init__(self, *, connection: duckdb.DuckDBPyConnection, uri: str, token: str, token_refresher: "Callable[[], str] | None" = None):
         self._connection = connection
         self._uri = uri
         self._token = token
         self._disable_ssl = is_local_quack_uri(uri)
+        self._token_refresher = token_refresher
 
-    def execute(self, query: str, params: list[Any] | tuple[Any, ...] | None = None) -> QuackCursor:
-        rendered = _render_sql(query, params)
-        wrapper = (
+    def _build_wrapper(self, rendered: str) -> str:
+        return (
             "SELECT * FROM quack_query("
             f"'{_sql_literal(self._uri)}', "
             f"'{_sql_literal(rendered)}', "
@@ -51,7 +51,17 @@ class QuackConnection:
             f"token => '{_sql_literal(self._token)}'"
             ")"
         )
-        rows = self._connection.execute(wrapper).fetchall()
+
+    def execute(self, query: str, params: list[Any] | tuple[Any, ...] | None = None) -> QuackCursor:
+        rendered = _render_sql(query, params)
+        try:
+            rows = self._connection.execute(self._build_wrapper(rendered)).fetchall()
+        except duckdb.InvalidInputException as exc:
+            if "Authentication failed" not in str(exc) or self._token_refresher is None:
+                raise
+            # Token rotated while this connection was open — refresh and retry once.
+            self._token = self._token_refresher()
+            rows = self._connection.execute(self._build_wrapper(rendered)).fetchall()
         return QuackCursor(rows)
 
     def close(self) -> None:
@@ -237,14 +247,14 @@ def _value_literal(value: Any) -> str:
     return f"'{_sql_literal(str(value))}'"
 
 
-def quack_connect(uri: str, token: str) -> QuackConnection:
+def quack_connect(uri: str, token: str, *, token_refresher: "Callable[[], str] | None" = None) -> QuackConnection:
     connection = duckdb.connect()
     try:
         _load_or_install_quack(connection)
     except Exception as exc:
         connection.close()
         raise QuackConnectionError(f"unable to connect to Quack URI {uri}: {exc}") from exc
-    conn = QuackConnection(connection=connection, uri=uri, token=token)
+    conn = QuackConnection(connection=connection, uri=uri, token=token, token_refresher=token_refresher)
     try:
         conn.execute("SELECT 1")
     except duckdb.InvalidInputException as exc:

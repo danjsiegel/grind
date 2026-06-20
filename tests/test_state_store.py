@@ -291,7 +291,7 @@ def test_bootstrap_state_store_can_route_through_quack_connection(tmp_path: Path
     monkeypatch.setattr("grind.state.store.ensure_local_quack_server", fake_ensure_local_quack_server)
     monkeypatch.setattr(
         "grind.state.store.quack_connect",
-        lambda uri, token: duckdb.connect(str(remote_path)),
+        lambda uri, token, **kw: duckdb.connect(str(remote_path)),
     )
 
     bootstrap_state_store(database_path)
@@ -319,7 +319,7 @@ def test_open_state_store_auto_starts_local_quack_when_token_missing(tmp_path: P
     monkeypatch.setattr("grind.state.store.ensure_local_quack_server", fake_ensure_local_quack_server)
     monkeypatch.setattr(
         "grind.state.store.quack_connect",
-        lambda uri, token: duckdb.connect(str(remote_path)),
+        lambda uri, token, **kw: duckdb.connect(str(remote_path)),
     )
 
     bootstrap_state_store(database_path)
@@ -344,7 +344,7 @@ def test_bootstrap_state_store_skips_migrations_for_local_quack_when_token_prese
     )
     monkeypatch.setattr(
         "grind.state.store.quack_connect",
-        lambda uri, token: (_ for _ in ()).throw(AssertionError("bootstrap should not open a Quack connection")),
+        lambda uri, token, **kw: (_ for _ in ()).throw(AssertionError("bootstrap should not open a Quack connection")),
     )
 
     bootstrap_state_store(database_path)

@@ -26,7 +26,7 @@ def _patch_quack_route(monkeypatch, tmp_path: Path) -> None:
     monkeypatch.setattr("grind.state.store.ensure_local_quack_server", fake_ensure_local_quack_server)
     monkeypatch.setattr(
         "grind.state.store.quack_connect",
-        lambda uri, token: duckdb.connect(str(remote_path)),
+        lambda uri, token, **kw: duckdb.connect(str(remote_path)),
     )
 
 

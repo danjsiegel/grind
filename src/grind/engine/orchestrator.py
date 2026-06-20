@@ -8,7 +8,6 @@ from decimal import Decimal
 import json
 import os
 from pathlib import Path
-import re
 import secrets
 import socket
 
@@ -98,14 +97,21 @@ def _sanitize_planning_text(text: str) -> str:
     if not cleaned:
         return ""
 
+    marker_stripped = False
     for marker in ("Here is the operator review plan:", "Here is the plan:"):
         if marker in cleaned:
             cleaned = cleaned.split(marker, 1)[1].strip()
+            marker_stripped = True
 
     lines = cleaned.splitlines()
+    heading_anchored = False
     first_heading = next((index for index, line in enumerate(lines) if line.startswith("#")), None)
     if first_heading is not None:
-        cleaned = "\n".join(lines[first_heading:]).strip()
+        heading_line = lines[first_heading]
+        # Reject headings that appear inside code literal tokens (e.g. "\\n## foo",)
+        if not heading_line.rstrip().endswith(('",', "',", "'):", '("', "('")):
+            cleaned = "\n".join(lines[first_heading:]).strip()
+            heading_anchored = True
 
     cut_markers = (
         "\n## Operator Actions",
@@ -118,27 +124,19 @@ def _sanitize_planning_text(text: str) -> str:
         index = cleaned.find(marker)
         if index != -1:
             cut_at = min(cut_at, index)
-    return cleaned[:cut_at].strip()
+    result = cleaned[:cut_at].strip()
 
-
-def _looks_like_planning_transcript_noise(text: str) -> bool:
-    cleaned = text.strip()
-    if not cleaned:
-        return False
-    if cleaned.startswith('{"type":"tool_use"') or cleaned.startswith('{"type":"step_start"'):
-        return True
-
-    lines = cleaned.splitlines()
-    numbered_lines = sum(1 for line in lines if re.match(r"^\d+:\s", line))
-    if numbered_lines >= 8 and any(marker in cleaned for marker in ("def ", "class ", "<content>", "callID", "sessionID")):
-        return True
-    if cleaned.startswith('"):' ) and numbered_lines >= 5:
-        return True
-    return False
-
-
-def _is_generic_planning_fallback(text: str) -> bool:
-    return text.strip() == "Planner response persisted for operator review."
+    # Only return a non-empty result if we actually extracted something plan-like:
+    # either found a heading anchor, stripped a known marker, or applied a cut.
+    # Also accept plain prose that doesn't look like a code dump.
+    if not (heading_anchored or marker_stripped or cut_at < len(cleaned)):
+        # No structure was extracted. Accept the text only if it looks like
+        # prose (not a code dump with line-number prefixes like "167:  code").
+        import re as _re
+        code_dump_lines = sum(1 for line in cleaned.splitlines() if _re.match(r"^\d+:\s", line))
+        if code_dump_lines > 2:
+            return ""
+    return result
 
 
 def _planning_response_text(result: ModelInvocationResult | None, fallback: str) -> str:
@@ -148,10 +146,9 @@ def _planning_response_text(result: ModelInvocationResult | None, fallback: str)
             stripped_stdout = result.stdout.strip()
             if extracted.strip() != stripped_stdout:
                 sanitized = _sanitize_planning_text(extracted)
-                if sanitized and not _looks_like_planning_transcript_noise(sanitized):
+                if sanitized:
                     return sanitized
-                if not _looks_like_planning_transcript_noise(extracted):
-                    return extracted.strip()
+                return extracted.strip()
 
         stripped_stdout = result.stdout.strip()
         if stripped_stdout:
@@ -174,20 +171,15 @@ def _planning_response_text(result: ModelInvocationResult | None, fallback: str)
 
             if extracted.strip():
                 sanitized = _sanitize_planning_text(extracted)
-                if sanitized and not _looks_like_planning_transcript_noise(sanitized):
+                if sanitized:
                     return sanitized
-                if not _looks_like_planning_transcript_noise(extracted):
-                    return extracted.strip()
+                # _sanitize_planning_text found nothing plan-like — don't return
+                # the raw text as a "plan"; fall through to the Planner fallback.
         if result.stderr.strip():
             sanitized = _sanitize_planning_text(result.stderr)
-            if sanitized and not _looks_like_planning_transcript_noise(sanitized):
+            if sanitized:
                 return sanitized
-            if not _looks_like_planning_transcript_noise(result.stderr):
-                return result.stderr.strip()
 
-    fallback = _sanitize_planning_text(fallback)
-    if fallback and not _looks_like_planning_transcript_noise(fallback) and not _is_generic_planning_fallback(fallback):
-        return fallback
     return "Planner returned no reviewable text."
 
 
@@ -372,14 +364,12 @@ class MinimalOrchestrator:
         self.config = load_engine_config(self.config_path)
         self.database_path = self.config.state_path(cwd)
         self.db_uri = self.config.state_db_uri()
-        self.quack_token = os.getenv("GRIND_DB_TOKEN")
         if self.config.state.require_quack and not (self.db_uri and self.db_uri.startswith("quack:")):
             raise QuackConnectionError(
                 "Quack is required by configuration for this workspace; set state.db_uri or GRIND_DB_URI to a quack: URI"
             )
+        self.quack_token: str | None = None
         if self.db_uri and self.db_uri.startswith("quack:") and is_local_quack_uri(self.db_uri):
-            # For local Quack, always resolve the current token from the running
-            # server rather than trusting a potentially stale GRIND_DB_TOKEN env var.
             self.quack_token = ensure_local_quack_server(self.database_path, self.db_uri)
         self.artifacts_root = self.config.artifacts_root(cwd)
         self.worker_id = f"worker_{socket.gethostname()}_{os.getpid()}_{secrets.token_hex(4)}"
@@ -397,7 +387,13 @@ class MinimalOrchestrator:
         self._register_worker()
 
     def _open_store(self):
-        return open_state_store(self.database_path, db_uri=self.db_uri, quack_token=self.quack_token)
+        # Re-resolve the token each time for local Quack so the heartbeat thread
+        # and other long-running calls don't use a snapshot token that may have
+        # rotated since init.
+        token = self.quack_token
+        if self.db_uri and is_local_quack_uri(self.db_uri):
+            token = ensure_local_quack_server(self.database_path, self.db_uri)
+        return open_state_store(self.database_path, db_uri=self.db_uri, quack_token=token)
 
     def _resolve_policy_pack_path(self, policy_pack_path: Path | None) -> Path | None:
         if policy_pack_path is not None:
@@ -444,6 +440,15 @@ class MinimalOrchestrator:
     @contextmanager
     def _lease_guard(self, store: object, run_id: str):
         self._register_worker(store)
+        # Before acquiring, expire any lease held by a dead worker (no heartbeat
+        # for 30+ seconds) so stale leases from crashed processes don't block us.
+        existing = store.run_leases.get_active_by_run(run_id)
+        if existing is not None and existing.worker_id != self.worker_id:
+            worker = store.workers.get(existing.worker_id)
+            from datetime import timedelta
+            cutoff = _utc_now() - timedelta(seconds=30)
+            if worker is None or worker.last_seen_at < cutoff:
+                store.run_leases.expire(existing.lease_id)
         lease = acquire_lease(store.connection, run_id, self.worker_id)
         heartbeat = BackgroundHeartbeat(
             heartbeat=self._heartbeat_worker_once,
@@ -582,7 +587,7 @@ class MinimalOrchestrator:
 
             with self._lease_guard(store, run_id):
                 try:
-                    planning_result = invoke_text_prompt(planner, prompt=planning_prompt, cwd=self.cwd, timeout_seconds=planner.timeout_seconds)
+                    planning_result = invoke_text_prompt(planner, prompt=planning_prompt, cwd=self.cwd)
                     planning_status = StageStatus.COMPLETED
                     planning_summary = "Planner response persisted for operator review."
                 except ModelInvocationError as error:
@@ -723,14 +728,21 @@ class MinimalOrchestrator:
 
         with self._open_store() as store:
             run = self._resolve_run(store, run_id)
-            if run.state == RunState.DOING and store.run_leases.get_active_by_run(run_id) is None:
-                return self._resume_interrupted_doing_run(
-                    store=store,
-                    run=run,
-                    checkpoint_id=checkpoint_id,
-                    restore_checkpoint=restore_checkpoint,
-                    finalize=finalize,
-                )
+            if run.state in (RunState.DOING, RunState.VALIDATING):
+                # Check if the active lease belongs to a dead worker (no heartbeat
+                # in the last 30 seconds) and treat it as absent if so.
+                active_lease = store.run_leases.get_active_by_run(run_id)
+                lease_is_live = False
+                if active_lease is not None:
+                    worker = store.workers.get(active_lease.worker_id)
+                    if worker is not None:
+                        from datetime import timedelta
+                        cutoff = _utc_now() - timedelta(seconds=30)
+                        lease_is_live = worker.last_seen_at >= cutoff
+                if not lease_is_live:
+                    self._recover_interrupted_doing_run(store=store, run=run)
+                    # Fall through — run is now AWAITING_OPERATOR+approved.
+                    run = self._resolve_run(store, run_id)
             if run.state != RunState.AWAITING_OPERATOR:
                 raise ValueError(f"run is not awaiting operator input: {run.state.value}")
 
@@ -1015,251 +1027,6 @@ class MinimalOrchestrator:
 
         raise RuntimeError(f"resume terminated unexpectedly for run {run_id}")
 
-    def _resume_interrupted_doing_run(
-        self,
-        *,
-        store: object,
-        run: Run,
-        checkpoint_id: str | None,
-        restore_checkpoint: bool,
-        finalize,
-    ) -> ResumeOutcome:
-        tasks = store.tasks.list_by_run(run.run_id)
-        if not tasks:
-            raise ValueError(f"run has no tasks: {run.run_id}")
-        task = tasks[-1]
-        restored_checkpoint_id: str | None = None
-        if restore_checkpoint:
-            restored_checkpoint_id = self._restore_checkpoint_in_store(
-                store=store,
-                run_id=run.run_id,
-                checkpoint_id=checkpoint_id,
-            )
-
-        def make_resume_outcome(
-            *,
-            validation_stage_id: str,
-            final_state: RunState,
-            operator_status: OperatorStatus,
-        ) -> ResumeOutcome:
-            updated_run = self._resolve_run(store, run.run_id)
-            return finalize(ResumeOutcome(
-                run_id=run.run_id,
-                task_id=task.task_id,
-                validation_stage_id=validation_stage_id,
-                final_state=final_state,
-                operator_status=operator_status,
-                hold_type=updated_run.current_hold_type.value if updated_run.current_hold_type else None,
-                hold_reason=self._current_hold_reason(store, updated_run.run_id),
-                hold_context=updated_run.current_hold_context,
-                restored_checkpoint_id=restored_checkpoint_id,
-                database_path=self.database_path,
-                artifacts_root=self.artifacts_root,
-            ))
-
-        with self._lease_guard(store, run.run_id):
-            store.operator_actions.create(
-                OperatorActionRecord(
-                    action_id=_prefixed_id("action"),
-                    run_id=run.run_id,
-                    action_type=OperatorActionType.RESUME,
-                    note="Recovered interrupted do stage.",
-                    checkpoint_id=restored_checkpoint_id,
-                )
-            )
-
-            interrupted_stage = self._latest_stage_by_name(store=store, run_id=run.run_id, stage_name="doing")
-            if interrupted_stage is not None and interrupted_stage.status == StageStatus.RUNNING:
-                store.stages.complete(
-                    interrupted_stage.stage_id,
-                    status=StageStatus.FAILED.value,
-                    summary="interrupted do stage recovered by resume",
-                )
-
-            previous_actionable_ids = self._actionable_stable_ids_for_iteration(
-                store=store,
-                run_id=run.run_id,
-                iteration=run.iteration_count,
-            )
-            iteration = max(run.iteration_count + 1, 1)
-            try:
-                do_output = self._run_do_stage(
-                    store=store,
-                    run=run,
-                    task=task,
-                    iteration=iteration,
-                )
-            except ValueError as error:
-                self._transition(
-                    store=store,
-                    run_id=run.run_id,
-                    from_state=RunState.DOING,
-                    to_state=RunState.FAILED,
-                    reason=str(error),
-                )
-                store.tasks.update_status(task.task_id, status=TaskStatus.FAILED.value)
-                raise
-
-            self._transition(
-                store=store,
-                run_id=run.run_id,
-                from_state=RunState.DOING,
-                to_state=RunState.AWAITING_VALIDATION,
-                reason="recovered interrupted do stage and resumed validation cycle",
-            )
-            observed_delta = self._observed_delta_from_do_output(do_output)
-
-            while True:
-                store.runs.set_iteration_count(run.run_id, iteration_count=iteration)
-                updated_run = self._resolve_run(store, run.run_id)
-                cycle_status, validation_stage_id, actionable_findings = self._run_validation_review_cycle(
-                    store=store,
-                    run=updated_run,
-                    task=task,
-                    iteration=iteration,
-                    observed_delta=observed_delta,
-                )
-                if cycle_status == "hold":
-                    return make_resume_outcome(
-                        validation_stage_id=validation_stage_id,
-                        final_state=RunState.AWAITING_OPERATOR,
-                        operator_status=OperatorStatus.HOLD,
-                    )
-                if cycle_status == "passed":
-                    self._transition(
-                        store=store,
-                        run_id=run.run_id,
-                        from_state=RunState.CHECK_PASSED,
-                        to_state=RunState.COMPLETED,
-                        reason="review cycle completed without actionable findings",
-                        operator_status=OperatorStatus.NONE,
-                    )
-                    store.tasks.update_status(task.task_id, status=TaskStatus.COMPLETED.value)
-                    return make_resume_outcome(
-                        validation_stage_id=validation_stage_id,
-                        final_state=RunState.COMPLETED,
-                        operator_status=OperatorStatus.NONE,
-                    )
-
-                actionable_ids = {finding.stable_id for finding in actionable_findings}
-                updated_run = self._resolve_run(store, run.run_id)
-                if self._should_hold_for_diminishing_returns(previous_actionable_ids, actionable_ids):
-                    self._transition(
-                        store=store,
-                        run_id=run.run_id,
-                        from_state=RunState.CHECK_FAILED,
-                        to_state=RunState.AWAITING_OPERATOR,
-                        reason=(
-                            f"{HoldType.DIMINISHING_RETURNS.value}: actionable findings repeated across iterations; "
-                            "operator review required"
-                        ),
-                        operator_status=OperatorStatus.HOLD,
-                        hold_type=HoldType.DIMINISHING_RETURNS,
-                        hold_context={
-                            "iteration": iteration,
-                            "stable_ids": sorted(actionable_ids),
-                        },
-                    )
-                    store.tasks.update_status(task.task_id, status=TaskStatus.IN_PROGRESS.value)
-                    return make_resume_outcome(
-                        validation_stage_id=validation_stage_id,
-                        final_state=RunState.AWAITING_OPERATOR,
-                        operator_status=OperatorStatus.HOLD,
-                    )
-                if iteration >= updated_run.max_iterations:
-                    self._transition(
-                        store=store,
-                        run_id=run.run_id,
-                        from_state=RunState.CHECK_FAILED,
-                        to_state=RunState.AWAITING_OPERATOR,
-                        reason=(
-                            f"{HoldType.MAX_ITERATIONS.value}: hit max iterations ({updated_run.max_iterations}); "
-                            "operator review required"
-                        ),
-                        operator_status=OperatorStatus.HOLD,
-                        hold_type=HoldType.MAX_ITERATIONS,
-                        hold_context={
-                            "iteration": iteration,
-                            "max_iterations": updated_run.max_iterations,
-                            "stable_ids": sorted(actionable_ids),
-                        },
-                    )
-                    store.tasks.update_status(task.task_id, status=TaskStatus.IN_PROGRESS.value)
-                    return make_resume_outcome(
-                        validation_stage_id=validation_stage_id,
-                        final_state=RunState.AWAITING_OPERATOR,
-                        operator_status=OperatorStatus.HOLD,
-                    )
-                if updated_run.budget_limit_usd is not None and updated_run.total_cost_usd >= updated_run.budget_limit_usd:
-                    self._transition(
-                        store=store,
-                        run_id=run.run_id,
-                        from_state=RunState.CHECK_FAILED,
-                        to_state=RunState.AWAITING_OPERATOR,
-                        reason=(
-                            f"{HoldType.BUDGET_EXCEEDED.value}: run exceeded budget limit; operator review required"
-                        ),
-                        operator_status=OperatorStatus.HOLD,
-                        hold_type=HoldType.BUDGET_EXCEEDED,
-                        hold_context={
-                            "iteration": iteration,
-                            "total_cost_usd": str(updated_run.total_cost_usd),
-                            "budget_limit_usd": str(updated_run.budget_limit_usd),
-                        },
-                    )
-                    store.tasks.update_status(task.task_id, status=TaskStatus.IN_PROGRESS.value)
-                    return make_resume_outcome(
-                        validation_stage_id=validation_stage_id,
-                        final_state=RunState.AWAITING_OPERATOR,
-                        operator_status=OperatorStatus.HOLD,
-                    )
-
-                act_stage_id = _prefixed_id("stage")
-                self._capture_pre_act_checkpoint(
-                    store=store,
-                    run_id=run.run_id,
-                    task_id=task.task_id,
-                    stage_id=act_stage_id,
-                    iteration=iteration,
-                )
-                self._transition(
-                    store=store,
-                    run_id=run.run_id,
-                    from_state=RunState.CHECK_FAILED,
-                    to_state=RunState.ACTING,
-                    reason=f"entering act stage for {len(actionable_findings)} actionable findings",
-                )
-                try:
-                    act_output = self._run_act_stage(
-                        store=store,
-                        run=updated_run,
-                        task=task,
-                        stage_id=act_stage_id,
-                        iteration=iteration,
-                        findings=actionable_findings,
-                    )
-                except ValueError as error:
-                    self._transition(
-                        store=store,
-                        run_id=run.run_id,
-                        from_state=RunState.ACTING,
-                        to_state=RunState.FAILED,
-                        reason=str(error),
-                    )
-                    store.tasks.update_status(task.task_id, status=TaskStatus.FAILED.value)
-                    raise
-
-                self._transition(
-                    store=store,
-                    run_id=run.run_id,
-                    from_state=RunState.ACTING,
-                    to_state=RunState.AWAITING_VALIDATION,
-                    reason="act stage completed; rerunning validation",
-                )
-                previous_actionable_ids = actionable_ids
-                observed_delta = self._observed_delta_from_act_output(act_output)
-                iteration += 1
-
     def restore_checkpoint(self, *, run_id: str, checkpoint_id: str | None = None) -> WorkspaceCheckpoint:
         with self._open_store() as store:
             restored_checkpoint_id = self._restore_checkpoint_in_store(
@@ -1336,7 +1103,6 @@ class MinimalOrchestrator:
             model_entry["estimated_cost_usd"] += record.estimated_cost_usd or Decimal("0")
 
         retrieval_documents = self.retrieval_service.collection_stats(run_id=run.run_id) if self.retrieval_service else {}
-        retrieval_readiness = self.retrieval_service.collection_readiness(run_id=run.run_id) if self.retrieval_service else {}
         return {
             "run_id": run.run_id,
             "state": run.state.value,
@@ -1375,7 +1141,10 @@ class MinimalOrchestrator:
                 "queue_pending": sum(1 for record in retrieval_queue if record.queue_status == "pending"),
                 "queue_failed": sum(1 for record in retrieval_queue if record.queue_status == "failed"),
                 "documents_by_collection": retrieval_documents,
-                "readiness_by_collection": retrieval_readiness,
+                "readiness_by_collection": {
+                    name: {"state": "ready" if count > 0 else "empty"}
+                    for name, count in retrieval_documents.items()
+                },
             },
         }
 
@@ -1508,7 +1277,7 @@ class MinimalOrchestrator:
             )
 
             try:
-                planning_result = invoke_text_prompt(planner, prompt=planning_prompt, cwd=self.cwd, timeout_seconds=planner.timeout_seconds)
+                planning_result = invoke_text_prompt(planner, prompt=planning_prompt, cwd=self.cwd)
                 planning_status = StageStatus.COMPLETED
                 planning_summary = "Planner response persisted for operator review."
             except ModelInvocationError as error:
@@ -1806,7 +1575,7 @@ class MinimalOrchestrator:
         store.stages.create(stage)
 
         try:
-            result = invoke_text_prompt(implementer, prompt=prompt, cwd=self.cwd, timeout_seconds=implementer.timeout_seconds)
+            result = invoke_text_prompt(implementer, prompt=prompt, cwd=self.cwd)
             self._record_model_call(
                 store=store,
                 run_id=run.run_id,
@@ -1900,7 +1669,7 @@ class MinimalOrchestrator:
         store.stages.create(stage)
 
         try:
-            result = invoke_text_prompt(implementer, prompt=prompt, cwd=self.cwd, timeout_seconds=implementer.timeout_seconds)
+            result = invoke_text_prompt(implementer, prompt=prompt, cwd=self.cwd)
             self._record_model_call(
                 store=store,
                 run_id=run.run_id,
@@ -2500,7 +2269,7 @@ class MinimalOrchestrator:
         store.stages.create(stage)
 
         try:
-            result = invoke_text_prompt(checker, prompt=prompt, cwd=self.cwd, timeout_seconds=checker.timeout_seconds)
+            result = invoke_text_prompt(checker, prompt=prompt, cwd=self.cwd)
             self._record_model_call(
                 store=store,
                 run_id=run.run_id,
@@ -2656,7 +2425,7 @@ class MinimalOrchestrator:
         store.stages.create(stage)
 
         try:
-            result = invoke_text_prompt(adjudicator, prompt=prompt, cwd=self.cwd, timeout_seconds=adjudicator.timeout_seconds)
+            result = invoke_text_prompt(adjudicator, prompt=prompt, cwd=self.cwd)
             self._record_model_call(
                 store=store,
                 run_id=run.run_id,
@@ -2795,7 +2564,7 @@ class MinimalOrchestrator:
             )
             store.artifacts.create(prompt_artifact)
             try:
-                result = invoke_text_prompt(adjudicator, prompt=prompt, cwd=self.cwd, timeout_seconds=adjudicator.timeout_seconds)
+                result = invoke_text_prompt(adjudicator, prompt=prompt, cwd=self.cwd)
                 self._record_model_call(
                     store=store,
                     run_id=run.run_id,
@@ -3336,12 +3105,6 @@ class MinimalOrchestrator:
             "new_uncertainties": payload.new_uncertainties,
         }
 
-    def _latest_stage_by_name(self, *, store: object, run_id: str, stage_name: str) -> Stage | None:
-        stages = [stage for stage in store.stages.list_by_run(run_id) if stage.stage_name == stage_name]
-        if not stages:
-            return None
-        return stages[-1]
-
     def _record_invocation_cost(
         self,
         *,
@@ -3517,3 +3280,40 @@ class MinimalOrchestrator:
             )
         else:
             store.runs.clear_hold_context(run_id)
+
+    def _recover_interrupted_doing_run(
+        self,
+        *,
+        store: object,
+        run: Run,
+    ) -> None:
+        """Mark stale doing stage failed and reset run to AWAITING_OPERATOR+approved.
+
+        Called from within an open store context. After this returns the caller
+        should re-resolve the run and continue with the normal resume path.
+        """
+        run_id = run.run_id
+        stages = store.stages.list_by_run(run_id)
+        for stage in stages:
+            if stage.stage_name in ("doing", "validation") and stage.status == StageStatus.RUNNING:
+                store.stages.complete(
+                    stage.stage_id,
+                    status=StageStatus.FAILED.value,
+                    summary="interrupted stage recovered by resume",
+                )
+        store.operator_actions.create(
+            OperatorActionRecord(
+                action_id=_prefixed_id("action"),
+                run_id=run_id,
+                action_type=OperatorActionType.RESUME,
+                note="Recovered interrupted do stage.",
+            )
+        )
+        self._transition(
+            store=store,
+            run_id=run_id,
+            from_state=run.state,
+            to_state=RunState.AWAITING_OPERATOR,
+            reason=f"recovered interrupted {run.state.value} stage",
+            operator_status=OperatorStatus.APPROVED,
+        )

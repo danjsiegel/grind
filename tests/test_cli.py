@@ -490,7 +490,7 @@ def test_auto_prune_skips_quack_transport_delete_failures(tmp_path: Path, monkey
     )
     monkeypatch.setattr(
         "grind.state.store.quack_connect",
-        lambda uri, token: __import__("duckdb").connect(str(remote_path)),
+        lambda uri, token, **kw: __import__("duckdb").connect(str(remote_path)),
     )
 
     monkeypatch.setattr(

@@ -34,8 +34,12 @@ def _open_connection(
             raise QuackConnectionError(
                 "GRIND_DB_TOKEN is required when GRIND_DB_URI points at Quack"
             )
+        def _refresher() -> str:
+            return ensure_local_quack_server(database_path, effective_db_uri)
+
+        refresher = _refresher if is_local_quack_uri(effective_db_uri) else None
         try:
-            return quack_connect(effective_db_uri, effective_token)
+            return quack_connect(effective_db_uri, effective_token, token_refresher=refresher)
         except QuackConnectionError:
             if not is_local_quack_uri(effective_db_uri):
                 raise
@@ -45,11 +49,11 @@ def _open_connection(
             fresh_token = ensure_local_quack_server(database_path, effective_db_uri)
             if fresh_token != effective_token:
                 try:
-                    return quack_connect(effective_db_uri, fresh_token)
+                    return quack_connect(effective_db_uri, fresh_token, token_refresher=refresher)
                 except QuackConnectionError:
                     pass
             effective_token = ensure_local_quack_server(database_path, effective_db_uri, force_restart=True)
-            return quack_connect(effective_db_uri, effective_token)
+            return quack_connect(effective_db_uri, effective_token, token_refresher=refresher)
 
     resolved_path = _resolve_database_path(database_path, db_uri=effective_db_uri)
     resolved_path.parent.mkdir(parents=True, exist_ok=True)
