@@ -32,6 +32,11 @@ def test_forbidden_command_is_classified_risky() -> None:
     assert classify_command(["git", "reset", "--hard"]) == "risky"
 
 
+def test_pip_is_classified_as_elevated() -> None:
+    assert classify_command(["pip", "install", "requests"]) == "elevated"
+    assert classify_command(["pip3", "install", "-r", "requirements.txt"]) == "elevated"
+
+
 def test_classify_command_does_not_flag_force_with_lease_as_risky() -> None:
     # '--force-with-lease' starts with '--force' but is not a destructive forced push.
     assert classify_command(["git", "push", "--force-with-lease"]) == "safe"

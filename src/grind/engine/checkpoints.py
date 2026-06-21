@@ -8,7 +8,7 @@ from grind.artifacts import ArtifactStore
 from grind.models.artifact import ArtifactRecord
 
 
-EXCLUDED_PATHS = {".git", ".grind", ".kilo", ".venv", "__pycache__"}
+EXCLUDED_PATHS = {".git", ".grind", ".kilo", ".venv", "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache"}
 
 
 def capture_workspace_snapshot(

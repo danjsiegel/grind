@@ -25,6 +25,8 @@ ELEVATED_PREFIXES = {
     "apt-get",
     "brew",
     "yum",
+    "pip",
+    "pip3",
 }
 
 

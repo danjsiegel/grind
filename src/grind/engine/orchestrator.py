@@ -1009,7 +1009,7 @@ class MinimalOrchestrator:
                             reason="act stage completed; rerunning validation",
                         )
                         previous_actionable_ids = actionable_ids
-                        observed_delta = self._observed_delta_from_act_output(act_output)
+                        observed_delta = self._observed_delta_from_act_output(act_output, prev_delta=observed_delta)
                         iteration += 1
             except LeaseConflictError as error:
                 store.runs.set_operator_status(run_id, operator_status=OperatorStatus.HOLD.value)
@@ -1533,6 +1533,25 @@ class MinimalOrchestrator:
                 "content": self._load_artifact_content(self.artifact_store.resolve_path(selected)),
             }
 
+    def _load_approved_plan_text(self, store: object, run_id: str) -> str | None:
+        """Load the operator-approved plan text for the given run.
+
+        Looks up the latest planning stage with a plan_review output artifact and
+        reads the artifact content from the artifact store. Returns None if no plan
+        artifact is found or the file is unavailable.
+        """
+        try:
+            artifacts = store.artifacts.list_by_run(run_id)
+            plan_artifacts = [
+                artifact for artifact in artifacts if artifact.artifact_type == "plan_review"
+            ]
+            if not plan_artifacts:
+                return None
+            latest = plan_artifacts[-1]
+            return self.artifact_store.read_text(latest)
+        except Exception:
+            return None
+
     def _run_do_stage(
         self,
         *,
@@ -1546,7 +1565,13 @@ class MinimalOrchestrator:
         prompt_artifact_id = _prefixed_id("artifact")
         response_artifact_id = _prefixed_id("artifact")
         output_artifact_id = _prefixed_id("artifact")
-        prompt = self._do_prompt(objective=task.raw_input)
+        approved_plan = self._load_approved_plan_text(store, run.run_id)
+        policy_pack = self._policy_pack_for_run(run)
+        prompt = self._do_prompt(
+            objective=task.raw_input,
+            approved_plan=approved_plan,
+            safe_paths=policy_pack.safe_paths if policy_pack is not None else None,
+        )
         prompt_artifact = self.artifact_store.write_text(
             run_id=run.run_id,
             artifact_id=prompt_artifact_id,
@@ -1640,7 +1665,12 @@ class MinimalOrchestrator:
         prompt_artifact_id = _prefixed_id("artifact")
         response_artifact_id = _prefixed_id("artifact")
         output_artifact_id = _prefixed_id("artifact")
-        prompt = self._act_prompt(objective=task.raw_input, findings=findings)
+        policy_pack = self._policy_pack_for_run(run)
+        prompt = self._act_prompt(
+            objective=task.raw_input,
+            findings=findings,
+            safe_paths=policy_pack.safe_paths if policy_pack is not None else None,
+        )
         prompt_artifact = self.artifact_store.write_text(
             run_id=run.run_id,
             artifact_id=prompt_artifact_id,
@@ -2973,15 +3003,38 @@ class MinimalOrchestrator:
             "- Prefer concrete steps over narrative.\n"
         )
 
-    def _do_prompt(self, *, objective: str) -> str:
-        return (
-            "You are the do stage implementer for a grind run. Apply the approved plan in the workspace and return JSON only.\n\n"
-            f"Repository: {self.cwd}\n"
-            f"Objective: {objective.strip()}\n\n"
-            "Return exactly this JSON shape:\n"
-            '{"touched_files":["src/foo.py"],"touched_symbols":["Foo.bar"],"validation_hints":[{"command":"uv run pytest tests -q","reason":"changed behavior"}],"claims_made":[{"claim":"...","evidence":"..."}],"open_uncertainties":[],"artifact_refs":[]}\n\n'
-            "Only include JSON in your response."
-        )
+    def _do_prompt(
+        self,
+        *,
+        objective: str,
+        approved_plan: str | None = None,
+        safe_paths: list[str] | None = None,
+    ) -> str:
+        lines = [
+            "You are the do stage implementer for a grind run. Apply the approved plan in the workspace and return JSON only.",
+            "",
+            f"Repository: {self.cwd}",
+            f"Objective: {objective.strip()}",
+        ]
+        if approved_plan:
+            lines.extend([
+                "",
+                "Approved plan (operator-reviewed):",
+                approved_plan.strip(),
+            ])
+        if safe_paths:
+            lines.extend([
+                "",
+                f"Scope: restrict all changes to these paths: {', '.join(safe_paths)}. Do not modify files outside this set.",
+            ])
+        lines.extend([
+            "",
+            "Return exactly this JSON shape:",
+            '{"touched_files":["src/foo.py"],"touched_symbols":["Foo.bar"],"validation_hints":[{"command":"uv run pytest tests -q","reason":"changed behavior"}],"claims_made":[{"claim":"...","evidence":"..."}],"open_uncertainties":[],"artifact_refs":[]}',
+            "",
+            "Only include JSON in your response.",
+        ])
+        return "\n".join(lines)
 
     def _checker_prompt(
         self,
@@ -3070,21 +3123,39 @@ class MinimalOrchestrator:
             cwd=self.cwd,
         )
 
-    def _act_prompt(self, *, objective: str, findings: list[Finding]) -> str:
+    def _act_prompt(
+        self,
+        *,
+        objective: str,
+        findings: list[Finding],
+        safe_paths: list[str] | None = None,
+    ) -> str:
         findings_summary = "\n".join(
             f"- finding_id: {finding.finding_id}\n  stable_id: {finding.stable_id}\n  severity: {finding.severity.value}\n  title: {finding.title}\n  rationale: {finding.rationale}\n  exact_fix_action: {finding.exact_fix_action}"
             for finding in findings
         )
-        return (
-            "You are the act stage implementer for a grind run. Fix only the adjudicated actionable findings and return JSON only.\n\n"
-            f"Repository: {self.cwd}\n"
-            f"Objective: {objective.strip()}\n\n"
-            "Actionable findings:\n"
-            f"{findings_summary}\n\n"
-            "Return exactly this JSON shape:\n"
-            '{"triage":[{"finding_id":"...","action":"fixed","justification":"...","fix_artifact_id":null,"requested_validation_ids":[]}],"remaining_open_issues":[],"new_uncertainties":[]}\n\n'
-            "Keep fixes minimal and only include JSON in your response."
-        )
+        lines = [
+            "You are the act stage implementer for a grind run. Fix only the adjudicated actionable findings and return JSON only.",
+            "",
+            f"Repository: {self.cwd}",
+            f"Objective: {objective.strip()}",
+        ]
+        if safe_paths:
+            lines.extend([
+                "",
+                f"Scope: restrict all changes to these paths: {', '.join(safe_paths)}. Do not modify files outside this set.",
+            ])
+        lines.extend([
+            "",
+            "Actionable findings:",
+            findings_summary,
+            "",
+            "Return exactly this JSON shape:",
+            '{"triage":[{"finding_id":"...","action":"fixed","justification":"...","fix_artifact_id":null,"requested_validation_ids":[]}],"remaining_open_issues":[],"new_uncertainties":[]}',
+            "",
+            "Keep fixes minimal and only include JSON in your response.",
+        ])
+        return "\n".join(lines)
 
     def _observed_delta_from_do_output(self, payload: DoStageResponsePayload) -> dict[str, object]:
         return {
@@ -3097,9 +3168,13 @@ class MinimalOrchestrator:
             "artifact_refs": payload.artifact_refs,
         }
 
-    def _observed_delta_from_act_output(self, payload: ActStageResponsePayload) -> dict[str, object]:
+    def _observed_delta_from_act_output(self, payload: ActStageResponsePayload, *, prev_delta: dict[str, object] | None = None) -> dict[str, object]:
+        # Carry forward the reported_touched_files from the previous delta so the
+        # diff surface doesn't re-flag the same files as unreported on every iteration.
+        prev_touched = list(prev_delta.get("reported_touched_files", [])) if prev_delta else []
         return {
             "source_stage": "acting",
+            "reported_touched_files": prev_touched,
             "triage": [item.model_dump(mode="json") for item in payload.triage],
             "remaining_open_issues": payload.remaining_open_issues,
             "new_uncertainties": payload.new_uncertainties,

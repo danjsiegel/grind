@@ -1811,6 +1811,242 @@ def test_resume_holds_when_max_iterations_reached(tmp_path: Path, monkeypatch, c
     assert "acting" not in [stage.stage_name for stage in stages]
 
 
+def test_do_prompt_includes_approved_plan_and_safe_paths(tmp_path: Path, monkeypatch, capsys) -> None:
+    """Verify that the do-stage prompt surfaced to the implementer includes the
+    operator-approved plan text and the policy safe_paths so the implementer
+    knows what was planned and where it is allowed to make changes."""
+    main(["init", "--cwd", str(tmp_path)])
+    capsys.readouterr()
+
+    (tmp_path / ".grind" / "policy" / "project.yaml").write_text(
+        """schema_ver: "1"
+validation_commands:
+  - command: "uv run pytest tests -q"
+    risk: safe
+    timeout_seconds: 120
+safe_paths:
+  - "src/"
+  - "tests/"
+  - "pyproject.toml"
+""",
+        encoding="utf-8",
+    )
+
+    captured_do_prompts: list[str] = []
+
+    def model_response(prompt: str) -> ModelInvocationResult:
+        if prompt.startswith("You are planning a grind task"):
+            return ModelInvocationResult(
+                command=["fake-planner"],
+                stdout='{"plan":"1. Add the feature\\n2. Run uv run pytest tests -q"}',
+                stderr="",
+                returncode=0,
+            )
+        if prompt.startswith("You are the do stage implementer"):
+            captured_do_prompts.append(prompt)
+            return ModelInvocationResult(
+                command=["fake-implementer", "do"],
+                stdout=(
+                    '{"touched_files":["src/grind/engine/orchestrator.py"],'
+                    '"touched_symbols":["MinimalOrchestrator.resume"],'
+                    '"validation_hints":[{"command":"uv run pytest tests -q","reason":"workflow changed"}],'
+                    '"claims_made":[{"claim":"done","evidence":"it is done"}],'
+                    '"open_uncertainties":[],"artifact_refs":[]}'
+                ),
+                stderr="",
+                returncode=0,
+            )
+        if prompt.startswith("You are the checker stage"):
+            return ModelInvocationResult(
+                command=["fake-checker"],
+                stdout='{"summary":"no issues","findings":[]}',
+                stderr="",
+                returncode=0,
+            )
+        if prompt.startswith("You are the adjudicator stage"):
+            return ModelInvocationResult(
+                command=["fake-adjudicator"],
+                stdout='{"summary":"no dispositions needed","dispositions":[]}',
+                stderr="",
+                returncode=0,
+            )
+        raise AssertionError(f"unexpected prompt: {prompt}")
+
+    monkeypatch.setattr(
+        "grind.engine.orchestrator.invoke_text_prompt",
+        lambda profile, *, prompt, cwd, timeout_seconds=300: model_response(prompt),
+    )
+    monkeypatch.setattr(
+        "grind.engine.orchestrator.run_validation_commands",
+        lambda cwd, commands, *, stop_on_failure, timeout_seconds: [
+            _validation_result(commands, returncode=0, stdout="passed", stderr="")
+        ],
+    )
+
+    run_exit = main(["run", "ship it", "--cwd", str(tmp_path), "--json"])
+    run_payload = json.loads(capsys.readouterr().out)
+    assert run_exit == 0
+
+    resume_exit = main(["resume", run_payload["run_id"], "--cwd", str(tmp_path), "--json"])
+    resume_payload = json.loads(capsys.readouterr().out)
+    assert resume_exit == 0
+    assert resume_payload["final_state"] == "completed"
+
+    # Verify the do-stage prompt captured during the run
+    assert len(captured_do_prompts) == 1
+    do_prompt = captured_do_prompts[0]
+
+    # Approved plan text should be present
+    assert "Approved plan (operator-reviewed):" in do_prompt
+    assert "1. Add the feature" in do_prompt
+    assert "uv run pytest tests -q" in do_prompt
+
+    # Scope constraint should be present
+    assert "Scope:" in do_prompt
+    assert "src/" in do_prompt
+    assert "tests/" in do_prompt
+    assert "pyproject.toml" in do_prompt
+
+    # The do_prompt artifact should also contain the plan text
+    inspect_exit = main([
+        "inspect",
+        "do_prompt",
+        "--run-id",
+        run_payload["run_id"],
+        "--cwd",
+        str(tmp_path),
+        "--json",
+    ])
+    inspect_payload = json.loads(capsys.readouterr().out)
+    assert inspect_exit == 0
+    assert "Approved plan (operator-reviewed):" in inspect_payload["content"]
+    assert "Scope:" in inspect_payload["content"]
+
+
+def test_act_prompt_includes_safe_paths_from_policy(tmp_path: Path, monkeypatch, capsys) -> None:
+    """Verify the act-stage prompt includes the policy safe_paths scope constraint."""
+    main(["init", "--cwd", str(tmp_path)])
+    capsys.readouterr()
+
+    (tmp_path / ".grind" / "policy" / "project.yaml").write_text(
+        """schema_ver: "1"
+validation_commands:
+  - command: "uv run pytest tests -q"
+    risk: safe
+    timeout_seconds: 120
+safe_paths:
+  - "src/"
+  - "tests/"
+""",
+        encoding="utf-8",
+    )
+
+    captured_act_prompts: list[str] = []
+    checker_calls = {"count": 0}
+
+    def model_response(prompt: str) -> ModelInvocationResult:
+        if prompt.startswith("You are planning a grind task"):
+            return ModelInvocationResult(
+                command=["fake-planner"],
+                stdout='{"plan":"ship it"}',
+                stderr="",
+                returncode=0,
+            )
+        if prompt.startswith("You are the do stage implementer"):
+            return ModelInvocationResult(
+                command=["fake-implementer", "do"],
+                stdout=(
+                    '{"touched_files":["tests/test_cli.py"],"touched_symbols":[],'
+                    '"validation_hints":[],"claims_made":[],"open_uncertainties":[],"artifact_refs":[]}'
+                ),
+                stderr="",
+                returncode=0,
+            )
+        if prompt.startswith("You are the act stage implementer"):
+            captured_act_prompts.append(prompt)
+            finding_id = prompt.split("finding_id: ", 1)[1].split("\n", 1)[0]
+            return ModelInvocationResult(
+                command=["fake-implementer", "act"],
+                stdout=(
+                    '{"triage":[{'
+                    f'"finding_id":"{finding_id}","action":"fixed","justification":"Fixed.",'
+                    '"fix_artifact_id":null,"requested_validation_ids":[]}],'
+                    '"remaining_open_issues":[],"new_uncertainties":[]}'
+                ),
+                stderr="",
+                returncode=0,
+            )
+        if prompt.startswith("You are the checker stage"):
+            checker_calls["count"] += 1
+            if checker_calls["count"] == 1:
+                return ModelInvocationResult(
+                    command=["fake-checker"],
+                    stdout=(
+                        '{"summary":"one blocker","findings":[{"title":"Missing test",'
+                        '"severity":"high","confidence":"proven","category":"test_coverage",'
+                        '"rationale":"No coverage.",'
+                        '"exact_fix_action":"Add a test.",'
+                        '"file_path":"tests/test_cli.py","primary_symbol":"some_test","line_range":"1-5"}]}'
+                    ),
+                    stderr="",
+                    returncode=0,
+                )
+            return ModelInvocationResult(
+                command=["fake-checker"],
+                stdout='{"summary":"clean","findings":[]}',
+                stderr="",
+                returncode=0,
+            )
+        if prompt.startswith("You are the adjudicator stage"):
+            if "stable_id:" not in prompt:
+                # No candidate findings — return empty dispositions
+                return ModelInvocationResult(
+                    command=["fake-adjudicator"],
+                    stdout='{"summary":"no findings","dispositions":[]}',
+                    stderr="",
+                    returncode=0,
+                )
+            stable_id_val = prompt.split("stable_id: ", 1)[1].split("\n", 1)[0]
+            return ModelInvocationResult(
+                command=["fake-adjudicator"],
+                stdout=(
+                    '{"summary":"confirmed","dispositions":[{'
+                    f'"stable_id":"{stable_id_val}","decision":"open","justification":"Blocking."'
+                    '}]}'
+                ),
+                stderr="",
+                returncode=0,
+            )
+        raise AssertionError(f"unexpected prompt: {prompt}")
+
+    monkeypatch.setattr(
+        "grind.engine.orchestrator.invoke_text_prompt",
+        lambda profile, *, prompt, cwd, timeout_seconds=300: model_response(prompt),
+    )
+    monkeypatch.setattr(
+        "grind.engine.orchestrator.run_validation_commands",
+        lambda cwd, commands, *, stop_on_failure, timeout_seconds: [
+            _validation_result(commands, returncode=0, stdout="passed", stderr="")
+        ],
+    )
+
+    run_exit = main(["run", "ship it", "--cwd", str(tmp_path), "--json"])
+    run_payload = json.loads(capsys.readouterr().out)
+    assert run_exit == 0
+
+    resume_exit = main(["resume", run_payload["run_id"], "--cwd", str(tmp_path), "--json"])
+    resume_payload = json.loads(capsys.readouterr().out)
+    assert resume_exit == 0
+    assert resume_payload["final_state"] == "completed"
+
+    # Act prompt should contain the scope constraint
+    assert len(captured_act_prompts) >= 1
+    act_prompt = captured_act_prompts[0]
+    assert "Scope:" in act_prompt
+    assert "src/" in act_prompt
+    assert "tests/" in act_prompt
+
+
 def test_resume_holds_when_budget_limit_reached(tmp_path: Path, monkeypatch, capsys) -> None:
     main(["init", "--cwd", str(tmp_path)])
     capsys.readouterr()
