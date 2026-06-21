@@ -24,7 +24,6 @@ def test_load_engine_config_resolves_default_storage_locations(tmp_path: Path) -
     assert config.state.kind == "duckdb"
     assert config.state_path(tmp_path) == tmp_path / ".grind" / "state" / "grind.duckdb"
     assert config.state_db_uri() is None
-    assert config.state.require_quack is False
     assert config.artifacts_root(tmp_path) == tmp_path / ".grind" / "artifacts"
     assert config.retrieval_path(tmp_path) == tmp_path / ".grind" / "state" / "lancedb"
     assert config.retention_export_root(tmp_path) == tmp_path / ".grind" / "archive"
@@ -55,4 +54,3 @@ def test_load_engine_config_defaults_when_file_missing(tmp_path: Path) -> None:
 
     assert config.models["planner"].provider == "github_cli"
     assert config.validation.timeout_seconds == 120
-    assert config.state.require_quack is False

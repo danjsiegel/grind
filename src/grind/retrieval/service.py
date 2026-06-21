@@ -16,7 +16,6 @@ from grind.state import open_state_store
 
 
 class LanceDBRetrievalService:
-    COLLECTION_META_TABLE = "_collection_meta"
     INDEXABLE_ARTIFACT_TYPES: dict[str, str] = {
         "planning_prompt": "prompt_chunks",
         "do_prompt": "prompt_chunks",
@@ -164,33 +163,13 @@ class LanceDBRetrievalService:
         collection_names = [collection] if collection else [name for name in self._table_names(db) if not name.startswith("_")]
 
         results: list[dict[str, object]] = []
-        collection_readiness: dict[str, dict[str, object]] = {}
         for collection_name in collection_names:
             try:
                 table = db.open_table(collection_name)
             except Exception:
-                collection_readiness[collection_name] = {
-                    "state": "missing",
-                    "vector_compatible": False,
-                    "reason": "collection missing",
-                    "search_strategy": "lexical",
-                }
                 continue
             all_rows = table.to_arrow().to_pylist()
             filtered_rows = [row for row in all_rows if run_id is None or self._row_matches_run(row, run_id)]
-            readiness = self._collection_readiness(
-                db=db,
-                collection=collection_name,
-                row_count=len(filtered_rows),
-                query_backend=vector_batch.backend,
-                query_model=vector_batch.model,
-                query_dimensions=len(vector),
-            )
-            collection_strategy = strategy if readiness["vector_compatible"] else "lexical"
-            collection_readiness[collection_name] = {
-                **readiness,
-                "search_strategy": collection_strategy,
-            }
             results.extend(
                 self._search_collection(
                     collection_name=collection_name,
@@ -198,12 +177,52 @@ class LanceDBRetrievalService:
                     rows=filtered_rows,
                     query=query,
                     vector=vector,
-                    strategy=collection_strategy,
+                    strategy=strategy,
                     limit=requested_limit,
                 )
             )
 
         results.sort(key=lambda item: item["score"], reverse=True)
+        # Build per-collection readiness. A collection is "incompatible" when
+        # documents were indexed with a real embedding backend (not hash-fallback)
+        # but the current query fell back to hash-fallback, so vector scores would
+        # be meaningless. When both sides use hash-fallback, lexical search works fine.
+        col_stats = self.collection_stats(run_id=run_id)
+        collection_readiness: dict[str, dict[str, str]] = {}
+
+        if vector_batch.backend == "hash-fallback":
+            # Check per-collection whether the stored docs used a real embedding
+            # by inspecting the metadata_json of sample rows.
+            db2 = lancedb.connect(str(self.db_path))
+            for col in collection_names:
+                try:
+                    table = db2.open_table(col)
+                    sample_rows = table.to_arrow().to_pylist()[:10]
+                    import json as _json
+                    has_real_embeddings = False
+                    for r in sample_rows:
+                        meta = r.get("metadata_json") or "{}"
+                        try:
+                            parsed = _json.loads(meta) if isinstance(meta, str) else meta
+                        except Exception:
+                            parsed = {}
+                        if parsed.get("embedding_backend", "hash-fallback") != "hash-fallback":
+                            has_real_embeddings = True
+                            break
+                except Exception:
+                    has_real_embeddings = False
+                if has_real_embeddings and col_stats.get(col, 0) > 0:
+                    collection_readiness[col] = {"state": "incompatible", "search_strategy": "lexical"}
+                elif col_stats.get(col, 0) > 0:
+                    collection_readiness[col] = {"state": "ready", "search_strategy": "hybrid_hash_lexical"}
+                else:
+                    collection_readiness[col] = {"state": "empty", "search_strategy": "lexical"}
+        else:
+            for col in collection_names:
+                if col_stats.get(col, 0) > 0:
+                    collection_readiness[col] = {"state": "ready", "search_strategy": strategy}
+                else:
+                    collection_readiness[col] = {"state": "empty", "search_strategy": strategy}
         return {
             "enabled": True,
             "query": query,
@@ -213,27 +232,6 @@ class LanceDBRetrievalService:
             "collection_readiness": collection_readiness,
             "results": results[:requested_limit],
         }
-
-    def collection_readiness(self, *, run_id: str | None = None) -> dict[str, dict[str, object]]:
-        if not self.config.retrieval.enabled:
-            return {}
-
-        db = lancedb.connect(str(self.db_path))
-        readiness: dict[str, dict[str, object]] = {}
-        for collection_name in [name for name in self._table_names(db) if not name.startswith("_")]:
-            table = db.open_table(collection_name)
-            rows = table.to_arrow().to_pylist()
-            if run_id is not None:
-                rows = [row for row in rows if self._row_matches_run(row, run_id)]
-            readiness[collection_name] = self._collection_readiness(
-                db=db,
-                collection=collection_name,
-                row_count=len(rows),
-                query_backend=None,
-                query_model=None,
-                query_dimensions=self.config.retrieval.embedding_dimensions,
-            )
-        return readiness
 
     def collection_stats(self, *, run_id: str | None = None) -> dict[str, int]:
         if not self.config.retrieval.enabled:
@@ -453,11 +451,9 @@ class LanceDBRetrievalService:
                 table.delete(delete_filter)
             if documents:
                 table.add(documents)
-                self._write_collection_meta(db=db, collection=collection, documents=documents, row_count=len(table.to_arrow().to_pylist()))
             return
         if documents:
             db.create_table(collection, data=documents)
-            self._write_collection_meta(db=db, collection=collection, documents=documents, row_count=len(documents))
 
     def _table_names(self, db: object) -> list[str]:
         if hasattr(db, "list_tables"):
@@ -469,99 +465,6 @@ class LanceDBRetrievalService:
         if hasattr(db, "table_names"):
             return list(db.table_names())
         return []
-
-    def _write_collection_meta(
-        self,
-        *,
-        db: object,
-        collection: str,
-        documents: list[dict[str, object]],
-        row_count: int,
-    ) -> None:
-        first_metadata = self._decode_metadata(documents[0].get("metadata_json")) if documents else None
-        backend = None
-        if isinstance(first_metadata, dict):
-            backend = first_metadata.get("embedding_backend")
-
-        record = {
-            "collection": collection,
-            "embedding_backend": backend or "unknown",
-            "embedding_provider": self.config.retrieval.embedding_provider,
-            "embedding_model": self.config.retrieval.embedding_model,
-            "embedding_dimensions": self.config.retrieval.embedding_dimensions,
-            "readiness_state": "ready" if row_count > 0 else "empty",
-            "document_count": row_count,
-        }
-        import datetime as _datetime
-
-        record["updated_at"] = _datetime.datetime.now(_datetime.timezone.utc).isoformat()
-
-        if self.COLLECTION_META_TABLE in self._table_names(db):
-            table = db.open_table(self.COLLECTION_META_TABLE)
-            table.delete(f"collection = {self._sql_literal(collection)}")
-            table.add([record])
-            return
-        db.create_table(self.COLLECTION_META_TABLE, data=[record])
-
-    def _read_collection_meta(self, *, db: object, collection: str) -> dict[str, object] | None:
-        if self.COLLECTION_META_TABLE not in self._table_names(db):
-            return None
-        table = db.open_table(self.COLLECTION_META_TABLE)
-        rows = table.to_arrow().to_pylist()
-        for row in rows:
-            if row.get("collection") == collection:
-                return row
-        return None
-
-    def _collection_readiness(
-        self,
-        *,
-        db: object,
-        collection: str,
-        row_count: int,
-        query_backend: str | None,
-        query_model: str | None,
-        query_dimensions: int,
-    ) -> dict[str, object]:
-        if row_count <= 0:
-            return {
-                "state": "empty",
-                "vector_compatible": False,
-                "reason": "collection has no rows",
-            }
-
-        meta = self._read_collection_meta(db=db, collection=collection)
-        if meta is None:
-            return {
-                "state": "stale",
-                "vector_compatible": False,
-                "reason": "collection metadata missing",
-            }
-
-        if query_backend is None:
-            return {
-                "state": str(meta.get("readiness_state") or "ready"),
-                "vector_compatible": False,
-                "reason": "query backend not provided",
-            }
-
-        compatible = (
-            meta.get("embedding_backend") == query_backend
-            and meta.get("embedding_provider") == self.config.retrieval.embedding_provider
-            and meta.get("embedding_model") == (query_model or self.config.retrieval.embedding_model)
-            and int(meta.get("embedding_dimensions") or 0) == query_dimensions
-        )
-        if compatible:
-            return {
-                "state": str(meta.get("readiness_state") or "ready"),
-                "vector_compatible": True,
-                "reason": "embedding metadata compatible",
-            }
-        return {
-            "state": "incompatible",
-            "vector_compatible": False,
-            "reason": "collection embeddings do not match current query embedding profile",
-        }
 
     def _chunk_text(self, text: str) -> list[str]:
         text = text.strip()

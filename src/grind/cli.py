@@ -6,21 +6,20 @@ from decimal import Decimal
 import json
 import os
 import secrets
-import socket
 import shlex
+import shutil
+import socket
 import sys
 from pathlib import Path
 
-import shutil
 from grind.config import EngineConfig, default_engine_config_path, init_engine_workspace, load_engine_config
-from grind.engine.leases import acquire_lease, release_lease
 from grind.engine.orchestrator import MinimalOrchestrator
 from grind.models import OperatorStatus, Run, RunState, Worker
 from grind.models.enums import TaskSourceKind
 from grind.providers import extract_text_output
 from grind.retrieval import LanceDBRetrievalService
-from grind.state.quack import QuackConnectionError, ensure_local_quack_server, is_local_quack_uri
 from grind.state import bootstrap_state_store, current_schema_version, open_state_store
+from grind.state.quack import QuackConnectionError, ensure_local_quack_server, is_local_quack_uri
 from grind.validation.safety import ValidationCommandError, classify_command, normalize_shell_free_command
 from grind.verification.models import VerificationOverallStatus, VerificationRequest
 from grind.verification.service import DefaultBackendVerifier, VerificationConfigError
@@ -236,7 +235,8 @@ def _synthesize_legacy_plan_review(*, plan_path: Path, planner_response_path: Pa
         if response_text == proposed_section.strip() and "Here is the operator review plan:" not in proposed_section:
             return None
 
-        plan_path.write_text(
+        synthesized_path = plan_path.with_name(f"{plan_path.stem}_clean.md")
+        synthesized_path.write_text(
             "\n".join(
                 [
                     "# Plan Review",
@@ -260,7 +260,7 @@ def _synthesize_legacy_plan_review(*, plan_path: Path, planner_response_path: Pa
             ),
             encoding="utf-8",
         )
-        return plan_path
+        return synthesized_path
 
     if plan_path.suffix.lower() != ".json":
         return None
@@ -281,7 +281,32 @@ def _synthesize_legacy_plan_review(*, plan_path: Path, planner_response_path: Pa
     if not response_text or _looks_like_planning_prompt(response_text):
         response_text = "Stored planner output is not a reviewable plan. Reject this hold and replan to generate a proper review brief."
 
-    return None
+    synthesized_path = plan_path.with_name(f"{plan_path.stem}_review.md")
+    synthesized_path.write_text(
+        "\n".join(
+            [
+                "# Plan Review",
+                "",
+                "This review brief was synthesized from a legacy hold artifact.",
+                "",
+                "## Objective",
+                "",
+                objective.strip(),
+                "",
+                "## Proposed Plan",
+                "",
+                response_text.strip(),
+                "",
+                "## Operator Actions",
+                "",
+                "- Approve only if this plan is specific, scoped, and reviewable.",
+                "- Reject and replan if the stored output is vague or not actually a plan.",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    return synthesized_path
 
 
 def _print_hold_guidance(
@@ -345,7 +370,6 @@ def _prune_run_records(*, database_path: Path, db_uri: str | None, run_id: str) 
         artifact_rows = store.artifacts.list_by_run(run_id)
         artifact_count = len(artifact_rows)
         artifact_bytes = sum(int(artifact.size_bytes or 0) for artifact in artifact_rows)
-        artifact_ids = [artifact.artifact_id for artifact in artifact_rows]
         stage_ids = [row[0] for row in store.connection.execute("SELECT stage_id FROM stages WHERE run_id = ?", [run_id]).fetchall()]
         task_ids = [row[0] for row in store.connection.execute("SELECT task_id FROM tasks WHERE run_id = ?", [run_id]).fetchall()]
 
@@ -388,8 +412,7 @@ def _prune_run_records(*, database_path: Path, db_uri: str | None, run_id: str) 
         store.connection.execute("DELETE FROM findings WHERE run_id = ?", [run_id])
         store.connection.execute("DELETE FROM stages WHERE run_id = ?", [run_id])
         store.connection.execute("DELETE FROM tasks WHERE run_id = ?", [run_id])
-        for artifact_id in artifact_ids:
-            store.connection.execute("DELETE FROM artifacts WHERE artifact_id = ?", [artifact_id])
+        store.connection.execute("DELETE FROM artifacts WHERE run_id = ?", [run_id])
         store.connection.execute("DELETE FROM runs WHERE run_id = ?", [run_id])
 
     return {
@@ -405,10 +428,9 @@ def _delete_run_artifacts(*, artifacts_root: Path, run_id: str) -> None:
         shutil.rmtree(run_dir)
 
 
-def _resolve_quack_token(*, database_path: Path, db_uri: str | None) -> str | None:
-    if not db_uri or not db_uri.startswith("quack:") or not is_local_quack_uri(db_uri):
-        return None
-    return ensure_local_quack_server(database_path, db_uri)
+def _vacuum_database(*, database_path: Path, db_uri: str | None) -> None:
+    with open_state_store(database_path, db_uri=db_uri) as store:
+        store.connection.execute("VACUUM")
 
 
 def _cleanup_artifact_layout(
@@ -448,11 +470,6 @@ def _cleanup_artifact_layout(
         "directories_removed": directories_removed,
         "dry_run": dry_run,
     }
-
-
-def _vacuum_database(*, database_path: Path, db_uri: str | None) -> None:
-    with open_state_store(database_path, db_uri=db_uri) as store:
-        store.connection.execute("VACUUM")
 
 
 def _prune_run_ids(
@@ -514,10 +531,9 @@ def _auto_prune_if_configured(*, cwd: Path, config: EngineConfig, retrieval_serv
             artifacts_root=config.artifacts_root(cwd),
             retrieval_service=retrieval_service,
         )
-    except Exception as error:
-        db_uri = config.state_db_uri()
-        if not db_uri or not db_uri.startswith("quack:"):
-            raise
+    except Exception as exc:
+        # Quack transport errors (e.g. index constraint bugs) must not turn a
+        # successful run into a failure. Surface as a skipped prune.
         return {
             "runs_pruned": 0,
             "artifacts_pruned": 0,
@@ -526,7 +542,7 @@ def _auto_prune_if_configured(*, cwd: Path, config: EngineConfig, retrieval_serv
             "retrieval_collections_pruned": {},
             "run_ids": run_ids,
             "skipped": True,
-            "reason": f"auto-prune skipped for Quack transport: {error}",
+            "reason": f"auto-prune skipped for Quack transport: {exc}",
         }
 
 
@@ -569,8 +585,14 @@ def _self_host_quack_probe(*, cwd: Path, config: EngineConfig) -> dict[str, obje
             total_cost_usd=Decimal("0"),
         )
         store.runs.create(run)
+        from grind.engine.leases import acquire_lease, release_lease
         lease = acquire_lease(store.connection, probe_run_id, probe_worker_id)
         release_lease(store.connection, lease.lease_id)
+
+    try:
+        _prune_run_records(database_path=database_path, db_uri=db_uri, run_id=probe_run_id)
+    except Exception:
+        pass
 
     return {"status": "passed", "reason": "Quack read/write probe succeeded", "db_uri": db_uri}
 
@@ -642,6 +664,8 @@ def _verify_self_host(*, cwd: Path, config_path: Path, strict: bool, smoke: bool
         "backends": backends,
         "validation": validation,
     }
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="grind")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -759,12 +783,6 @@ def build_parser() -> argparse.ArgumentParser:
     prune.add_argument("--dry-run", action="store_true")
     prune.add_argument("--json", action="store_true")
 
-    cleanup_artifacts = subparsers.add_parser("cleanup-artifacts")
-    cleanup_artifacts.add_argument("--cwd", type=Path)
-    cleanup_artifacts.add_argument("--config", dest="config_path", type=Path)
-    cleanup_artifacts.add_argument("--dry-run", action="store_true")
-    cleanup_artifacts.add_argument("--json", action="store_true")
-
     verify_backend = subparsers.add_parser("verify-backend")
     verify_backend.add_argument(
         "--backend",
@@ -788,14 +806,20 @@ def build_parser() -> argparse.ArgumentParser:
     verify_backend.add_argument("--strict", action="store_true")
     verify_backend.add_argument("--json", action="store_true")
 
+    cleanup_artifacts = subparsers.add_parser("cleanup-artifacts")
+    cleanup_artifacts.add_argument("--cwd", type=Path)
+    cleanup_artifacts.add_argument("--config", dest="config_path", type=Path)
+    cleanup_artifacts.add_argument("--dry-run", action="store_true")
+    cleanup_artifacts.add_argument("--json", action="store_true")
+
     verify_self_host = subparsers.add_parser("verify-self-host")
     verify_self_host.add_argument("--cwd", type=Path)
     verify_self_host.add_argument("--config", dest="config_path", type=Path)
+    smoke_group2 = verify_self_host.add_mutually_exclusive_group()
+    smoke_group2.add_argument("--smoke", dest="smoke", action="store_true", default=True)
+    smoke_group2.add_argument("--no-smoke", dest="smoke", action="store_false")
     verify_self_host.add_argument("--strict", action="store_true")
     verify_self_host.add_argument("--json", action="store_true")
-    verify_self_host_smoke = verify_self_host.add_mutually_exclusive_group()
-    verify_self_host_smoke.add_argument("--smoke", dest="smoke", action="store_true", default=True)
-    verify_self_host_smoke.add_argument("--no-smoke", dest="smoke", action="store_false")
 
     return parser
 
@@ -821,49 +845,6 @@ def main(argv: list[str] | None = None) -> int:
         print(
             f"schema version: {current_schema_version(config.state_path(cwd), db_uri=config.state_db_uri())}"
         )
-        return 0
-
-    if args.command == "verify-self-host":
-        cwd = args.cwd or Path.cwd()
-        config_path = args.config_path or default_engine_config_path(cwd)
-        try:
-            payload = _verify_self_host(cwd=cwd, config_path=config_path, strict=args.strict, smoke=args.smoke)
-        except (VerificationConfigError, QuackConnectionError, ValueError) as error:
-            print(str(error), file=sys.stderr)
-            return 2
-
-        if args.json:
-            print(json.dumps(payload, indent=2))
-        else:
-            print(f"overall_status: {payload['overall_status']}")
-            print(f"quack: {payload['quack']['status']} ({payload['quack'].get('reason', '-')})")
-            print(f"backends: {payload['backends']['status']}")
-            print(f"validation: {payload['validation']['status']}")
-
-        if payload["overall_status"] == VerificationOverallStatus.FAILED.value:
-            return 1
-        if payload["overall_status"] != VerificationOverallStatus.PASSED.value:
-            return 2
-        return 0
-
-    if args.command == "cleanup-artifacts":
-        cwd = args.cwd or Path.cwd()
-        config_path = args.config_path or default_engine_config_path(cwd)
-        config = load_engine_config(config_path)
-        payload = _cleanup_artifact_layout(
-            database_path=config.state_path(cwd),
-            db_uri=config.state_db_uri(),
-            artifacts_root=config.artifacts_root(cwd),
-            quack_token=_resolve_quack_token(database_path=config.state_path(cwd), db_uri=config.state_db_uri()),
-            dry_run=args.dry_run,
-        )
-
-        if args.json:
-            print(json.dumps(payload, indent=2))
-        else:
-            print(f"orphan_files_deleted: {payload['orphan_files_deleted']}")
-            print(f"orphan_bytes_deleted: {payload['orphan_bytes_deleted']}")
-            print(f"directories_removed: {payload['directories_removed']}")
         return 0
 
     if args.command in {"run", "resume", "approve", "reject", "abort", "hold-reason", "patch-policy", "restore-checkpoint", "status", "findings", "inspect", "report", "retrieval-index", "retrieval-search", "prune"}:
@@ -1284,6 +1265,41 @@ def main(argv: list[str] | None = None) -> int:
             for result in payload["results"]:
                 print(f"{result['collection']} {result['chunk_id']} {result['score']}")
                 print(result["chunk_text"])
+        return 0
+
+    if args.command == "cleanup-artifacts":
+        cwd = args.cwd or Path.cwd()
+        config_path = args.config_path or default_engine_config_path(cwd)
+        config = load_engine_config(config_path)
+        payload = _cleanup_artifact_layout(
+            database_path=config.state_path(cwd),
+            db_uri=config.state_db_uri(),
+            artifacts_root=config.artifacts_root(cwd),
+            dry_run=args.dry_run,
+        )
+        if args.json:
+            print(json.dumps(payload, indent=2))
+        else:
+            print(f"orphan_files_deleted: {payload['orphan_files_deleted']}")
+            print(f"orphan_bytes_deleted: {payload['orphan_bytes_deleted']}")
+            print(f"directories_removed: {payload['directories_removed']}")
+        return 0
+
+    if args.command == "verify-self-host":
+        cwd = args.cwd or Path.cwd()
+        config_path = args.config_path or default_engine_config_path(cwd)
+        payload = _verify_self_host(cwd=cwd, config_path=config_path, strict=args.strict, smoke=args.smoke)
+        if args.json:
+            print(json.dumps(payload, indent=2))
+        else:
+            print(f"overall_status: {payload['overall_status']}")
+            print(f"quack: {payload['quack']['status']}")
+            print(f"backends: {payload['backends']['status']}")
+            print(f"validation: {payload['validation']['status']}")
+        if payload["overall_status"] == VerificationOverallStatus.FAILED.value:
+            return 1
+        if payload["overall_status"] != VerificationOverallStatus.PASSED.value:
+            return 2
         return 0
 
     if args.command != "verify-backend":

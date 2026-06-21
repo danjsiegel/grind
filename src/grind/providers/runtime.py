@@ -3,12 +3,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 import json
-import os
 from pathlib import Path
 from time import perf_counter
-import signal
 import subprocess
-import tempfile
 from typing import Any
 
 from grind.config import ModelProfileConfig
@@ -42,92 +39,33 @@ def invoke_text_prompt(
 ) -> ModelInvocationResult:
     command = _build_command(profile, prompt=prompt)
     started = perf_counter()
-    try:
-        stdout, stderr, returncode = _run_prompt_command(
-            command=command,
-            cwd=cwd,
-            timeout_seconds=timeout_seconds,
-        )
-    except _PromptTimeoutError as error:
-        latency_ms = int((perf_counter() - started) * 1000)
-        result = ModelInvocationResult(
-            command=command,
-            stdout=error.stdout,
-            stderr=error.stderr,
-            returncode=124,
-            latency_ms=latency_ms,
-            provider_metadata=_extract_provider_metadata(profile.provider, error.stdout),
-        )
-        raise ModelInvocationError(
-            f"model invocation timed out after {timeout_seconds} seconds",
-            result=result,
-        ) from error
+    completed = subprocess.run(
+        command,
+        cwd=str(cwd),
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=timeout_seconds,
+    )
     latency_ms = int((perf_counter() - started) * 1000)
-    provider_metadata = _extract_provider_metadata(profile.provider, stdout)
+    provider_metadata = _extract_provider_metadata(profile.provider, completed.stdout)
     result = ModelInvocationResult(
         command=command,
-        stdout=stdout,
-        stderr=stderr,
-        returncode=returncode,
+        stdout=completed.stdout,
+        stderr=completed.stderr,
+        returncode=completed.returncode,
         estimated_cost_usd=_coerce_decimal(provider_metadata.get("estimated_cost_usd")),
         input_tokens=_coerce_int(provider_metadata.get("input_tokens")),
         output_tokens=_coerce_int(provider_metadata.get("output_tokens")),
         latency_ms=latency_ms,
         provider_metadata=provider_metadata,
     )
-    if returncode != 0:
+    if completed.returncode != 0:
         raise ModelInvocationError(
-            stderr or stdout or "model invocation failed",
+            completed.stderr or completed.stdout or "model invocation failed",
             result=result,
         )
     return result
-
-
-@dataclass(frozen=True)
-class _PromptTimeoutError(RuntimeError):
-    stdout: str
-    stderr: str
-
-
-def _run_prompt_command(
-    *,
-    command: list[str],
-    cwd: Path,
-    timeout_seconds: int,
-) -> tuple[str, str, int]:
-    with tempfile.TemporaryDirectory(prefix="grind-model-") as temp_dir:
-        stdout_path = Path(temp_dir) / "stdout.txt"
-        stderr_path = Path(temp_dir) / "stderr.txt"
-        with stdout_path.open("w", encoding="utf-8") as stdout_handle, stderr_path.open("w", encoding="utf-8") as stderr_handle:
-            process = subprocess.Popen(
-                command,
-                cwd=str(cwd),
-                stdout=stdout_handle,
-                stderr=stderr_handle,
-                text=True,
-                start_new_session=True,
-            )
-            try:
-                returncode = process.wait(timeout=timeout_seconds)
-            except subprocess.TimeoutExpired as error:
-                _terminate_process_group(process.pid, sig=signal.SIGKILL)
-                process.wait(timeout=5)
-                stdout = stdout_path.read_text(encoding="utf-8")
-                stderr = stderr_path.read_text(encoding="utf-8")
-                raise _PromptTimeoutError(stdout=stdout, stderr=(stderr or str(error))) from error
-
-        stdout = stdout_path.read_text(encoding="utf-8")
-        stderr = stderr_path.read_text(encoding="utf-8")
-
-    _terminate_process_group(process.pid, sig=signal.SIGTERM)
-    return stdout, stderr, returncode
-
-
-def _terminate_process_group(pid: int, *, sig: signal.Signals) -> None:
-    try:
-        os.killpg(pid, sig)
-    except ProcessLookupError:
-        return
 
 
 def extract_text_output(stdout: str) -> str:
@@ -139,27 +77,12 @@ def extract_text_output(stdout: str) -> str:
     if parsed is None:
         embedded = _extract_embedded_json_candidate(stripped)
         if embedded is not None:
-            embedded_parsed = _parse_direct_json_maybe(embedded)
-            # Only treat embedded JSON as the full parsed response when it looks
-            # like a substantive reply (has response keys), not a small code snippet
-            # accidentally picked up from source code the model read during analysis.
-            if isinstance(embedded_parsed, dict) and any(
-                k in embedded_parsed for k in ("plan", "summary", "findings", "output_text", "text", "content")
-            ):
-                parsed = embedded_parsed
+            parsed = _parse_direct_json_maybe(embedded)
     if parsed is None:
         parsed = _parse_json_maybe(stripped)
     if parsed is None:
-        mixed_event_stream_text = _extract_event_stream_text_from_mixed_output(stripped)
-        if mixed_event_stream_text:
-            return mixed_event_stream_text
         return stripped
 
-    event_stream_text = _extract_event_stream_text(parsed)
-    if event_stream_text:
-        return event_stream_text
-
-    # Try direct text-value extraction (catches standalone {"plan":...} dicts in the list)
     extracted = _extract_text_values(parsed)
     if extracted:
         return "\n".join(part for part in extracted if part.strip()).strip()
@@ -288,83 +211,6 @@ def _extract_text_values(value: Any) -> list[str]:
                 output.extend(_extract_text_values(value[key]))
         return output
     return []
-
-
-def _extract_event_stream_text(parsed: Any) -> str:
-    if not isinstance(parsed, list):
-        return ""
-
-    # First priority: standalone {"plan":...} objects in the event list (Kilo instant format)
-    for item in parsed:
-        if isinstance(item, dict) and "plan" in item and "type" not in item:
-            plan = item.get("plan")
-            if isinstance(plan, str) and plan.strip():
-                return plan.strip()
-
-    text_candidates: list[str] = []
-    last_plan = ""
-    for item in parsed:
-        if not isinstance(item, dict):
-            continue
-        part = item.get("part")
-        if not isinstance(part, dict):
-            continue
-
-        part_type = part.get("type")
-        if part_type == "text":
-            text = part.get("text")
-            if isinstance(text, str) and text.strip():
-                plan = _extract_plan_from_text_candidate(text)
-                if plan:
-                    last_plan = plan
-                text_candidates.append(text.strip())
-
-    if last_plan:
-        return last_plan
-    if text_candidates:
-        return text_candidates[-1]
-    return ""
-
-
-def _extract_event_stream_text_from_mixed_output(payload: str) -> str:
-    parsed_lines: list[Any] = []
-    for line in payload.splitlines():
-        stripped = line.strip()
-        if not stripped:
-            continue
-        parsed_line = _parse_direct_json_maybe(stripped)
-        if parsed_line is not None:
-            parsed_lines.append(parsed_line)
-    if not parsed_lines:
-        return ""
-    return _extract_event_stream_text(parsed_lines)
-
-
-def _extract_plan_from_text_candidate(text: str) -> str:
-    embedded = _extract_embedded_json_candidate(text)
-    if embedded is not None:
-        parsed_embedded = _parse_direct_json_maybe(embedded)
-        if isinstance(parsed_embedded, dict):
-            plan = parsed_embedded.get("plan")
-            if isinstance(plan, str) and plan.strip():
-                return plan.strip()
-
-    decoder = json.JSONDecoder()
-    for marker in ("{\"plan\":", "{"):
-        start = text.find(marker)
-        if start == -1:
-            continue
-        candidate = text[start:].strip()
-        try:
-            parsed_candidate, _ = decoder.raw_decode(candidate)
-        except json.JSONDecodeError:
-            continue
-        if isinstance(parsed_candidate, dict):
-            plan = parsed_candidate.get("plan")
-            if isinstance(plan, str) and plan.strip():
-                return plan.strip()
-
-    return ""
 
 
 def _extract_provider_metadata(provider: str, stdout: str) -> dict[str, Any]:

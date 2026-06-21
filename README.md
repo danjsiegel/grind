@@ -10,10 +10,7 @@ findings, and holds instead of leaving everything in terminal scrollback.
 The point is simple: do not trust a single pass. Plan the change, make the
 change, validate what actually happened, and run an independent check before
 calling it done. If a change cannot survive validation and review, Grind does
-not call it done. The industry right now is going towards swarming with agents
-doing everything in parallel. Grind is the opposite: my thesis is that you should
-"Stop Building Swarms of Shit Agents" and instead scale a single agent that refuses
-to hallucinate. 
+not call it done.
 
 ## What Grind does today
 
@@ -22,7 +19,6 @@ to hallucinate.
   and operator actions in DuckDB
 - runs planner, implementer, checker, and adjudicator steps with resumable holds
 - supports Quack-aware state bootstrapping for shared multi-worker setups
-- can auto-start a local Quack server for self-hosting when the workspace is configured with `state.db_uri: quack:localhost` and `state.require_quack: true`
 - keeps validation output and review artifacts instead of treating them as
   throwaway logs
 
@@ -83,10 +79,10 @@ uv run --project /path/to/grind grind verify-backend --cwd /path/to/target-repo 
 uv run --project /path/to/grind grind run --cwd /path/to/target-repo "your objective here"
 ```
 
-Optional, for remote DuckDB transport experiments over Quack:
+Optional, for remote DuckDB transport experiments over Quack (preview; current upstream docs use `core_nightly`):
 
 ```bash
-uv run python -c "import duckdb; conn=duckdb.connect(); conn.execute('INSTALL quack'); conn.execute('LOAD quack;')"
+uv run python -c "import duckdb; conn=duckdb.connect(); conn.execute('INSTALL quack FROM core_nightly;'); conn.execute('LOAD quack;')"
 ```
 
 ---
@@ -130,8 +126,6 @@ Running `grind init --cwd "$TARGET_REPO"` creates these paths inside the target 
 - `.grind/state/grind.duckdb`
 - `.grind/artifacts/`
 - `.grind/archive/`
-
-`.grind/` is local runtime state. This repo now ignores it by default; if you previously tracked `.grind/verify/*.json`, remove them from the index so local backend probes stop creating Git churn.
 
 ---
 
@@ -202,8 +196,6 @@ Storage fields:
 |---|---|---|
 | `state.kind` | yes | currently `duckdb` |
 | `state.path` | yes | canonical ledger path; default `.grind/state/grind.duckdb` |
-| `state.db_uri` | no | set to a `quack:` URI to use Quack-backed shared state instead of direct local DuckDB |
-| `state.require_quack` | no | if `true`, Grind fails fast unless it can use Quack; for local `quack:localhost` it will auto-start a helper server |
 | `artifacts.root` | yes | local artifact root; default `.grind/artifacts` |
 | `retention.mode` | yes | currently `manual`; Grind does not auto-prune, but `grind prune` can remove old terminal runs and their artifacts |
 | `retention.export_root` | yes | reserved for future archive/export flows |
@@ -263,20 +255,6 @@ Exit codes: `0` all required probes passed, `1` a required probe failed, `2`
 configuration error or inconclusive result.
 
 ### `grind run`
-
-### Self-hosting without local DB lockouts
-
-If you want Grind to operate on itself or run multiple local worker processes, do not leave it on direct local DuckDB. Configure the local workspace like this instead:
-
-```yaml
-state:
-  kind: duckdb
-  path: .grind/state/grind.duckdb
-  db_uri: quack:localhost
-  require_quack: true
-```
-
-With that config, Grind will auto-start a local Quack helper the first time it needs the database. This avoids the single-process DuckDB file lock problem that makes `run`, `status`, `approve`, and `resume` fight each other during self-hosting.
 
 Create a real stored run in DuckDB.
 
