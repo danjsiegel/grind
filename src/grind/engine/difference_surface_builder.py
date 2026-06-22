@@ -61,13 +61,19 @@ def build_difference_surface(
     git_touched_files = _git_touched_files(cwd, scope_excludes=scope_excludes)
     authoritative_touched_files = sorted(set(added_files + modified_files + removed_files + git_touched_files))
 
-    existing_reported_files = sorted(path for path in reported_touched_files if path in current_snapshot)
-    missing_reported_files = sorted(path for path in reported_touched_files if path not in current_snapshot)
+    # If the implementer reported no touched files but there are git-touched files,
+    # treat the git-touched set as implicitly reported.  This prevents the checker
+    # from flagging every changed file as "unreported" just because the model omitted
+    # the touched_files list in its response.
+    effective_reported = reported_touched_files or (git_touched_files if git_touched_files else [])
+
+    existing_reported_files = sorted(path for path in effective_reported if path in current_snapshot)
+    missing_reported_files = sorted(path for path in effective_reported if path not in current_snapshot)
     reported_but_unchanged_files = sorted(
         path for path in existing_reported_files if path not in authoritative_touched_files
     )
     unreported_changed_files = sorted(
-        path for path in authoritative_touched_files if path not in reported_touched_files
+        path for path in authoritative_touched_files if path not in effective_reported
     )
 
     validation_summary = [

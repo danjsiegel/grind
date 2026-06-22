@@ -366,26 +366,42 @@ def _terminal_run_ids_to_prune(*, database_path: Path, db_uri: str | None, keep_
 
 
 def _prune_run_records(*, database_path: Path, db_uri: str | None, run_id: str) -> dict[str, int]:
-    with open_state_store(database_path, db_uri=db_uri) as store:
+    # Prune requires exclusive write access.  DuckDB FK constraints crash when
+    # deletions from parent tables are routed through Quack's attached-catalog
+    # context (the same category of Quack compat issue addressed by V7).
+    # For local Quack deployments, stop the server, connect directly to the
+    # DuckDB file, delete, then restart so FK verification runs against a plain
+    # DuckDB connection where the path resolver works correctly.
+    effective_db_uri = db_uri
+    quack_token_after: str | None = None
+    if db_uri and db_uri.startswith("quack:") and is_local_quack_uri(db_uri):
+        from grind.state.quack import (
+            _read_server_info, _terminate_pid, local_quack_runtime_dir
+        )
+        runtime_dir = local_quack_runtime_dir(database_path)
+        info = _read_server_info(runtime_dir / "server.json")
+        if info:
+            _terminate_pid(int(info.get("pid", 0)))
+        effective_db_uri = None  # use direct DuckDB connection
+
+    with open_state_store(database_path, db_uri=effective_db_uri) as store:
         artifact_rows = store.artifacts.list_by_run(run_id)
         artifact_count = len(artifact_rows)
         artifact_bytes = sum(int(artifact.size_bytes or 0) for artifact in artifact_rows)
         stage_ids = [row[0] for row in store.connection.execute("SELECT stage_id FROM stages WHERE run_id = ?", [run_id]).fetchall()]
         task_ids = [row[0] for row in store.connection.execute("SELECT task_id FROM tasks WHERE run_id = ?", [run_id]).fetchall()]
+        finding_ids = [row[0] for row in store.connection.execute("SELECT finding_id FROM findings WHERE run_id = ?", [run_id]).fetchall()]
 
         store.connection.execute("DELETE FROM adjudication_votes WHERE run_id = ?", [run_id])
         for stage_id in stage_ids:
             store.connection.execute("DELETE FROM adjudication_votes WHERE stage_id = ?", [stage_id])
-        store.connection.execute(
-            "DELETE FROM dispositions WHERE finding_id IN (SELECT finding_id FROM findings WHERE run_id = ?)",
-            [run_id],
-        )
+        # Delete child rows that reference findings before deleting findings themselves.
+        # Use explicit finding_id lists instead of subqueries to avoid Quack FK-check crashes.
+        for finding_id in finding_ids:
+            store.connection.execute("DELETE FROM dispositions WHERE finding_id = ?", [finding_id])
+            store.connection.execute("DELETE FROM finding_evidence WHERE finding_id = ?", [finding_id])
         for stage_id in stage_ids:
             store.connection.execute("DELETE FROM dispositions WHERE stage_id = ?", [stage_id])
-        store.connection.execute(
-            "DELETE FROM finding_evidence WHERE finding_id IN (SELECT finding_id FROM findings WHERE run_id = ?)",
-            [run_id],
-        )
         store.connection.execute("DELETE FROM validations WHERE run_id = ?", [run_id])
         for stage_id in stage_ids:
             store.connection.execute("DELETE FROM validations WHERE stage_id = ?", [stage_id])
@@ -409,11 +425,18 @@ def _prune_run_records(*, database_path: Path, db_uri: str | None, run_id: str) 
         store.connection.execute("DELETE FROM run_leases WHERE run_id = ?", [run_id])
         store.connection.execute("DELETE FROM transitions WHERE run_id = ?", [run_id])
         store.connection.execute("DELETE FROM workspace_checkpoints WHERE run_id = ?", [run_id])
-        store.connection.execute("DELETE FROM findings WHERE run_id = ?", [run_id])
+        # Delete findings row-by-row to avoid a Quack FK-verification crash that
+        # occurs when the server processes a multi-row DELETE with FK constraints.
+        for finding_id in finding_ids:
+            store.connection.execute("DELETE FROM findings WHERE finding_id = ?", [finding_id])
         store.connection.execute("DELETE FROM stages WHERE run_id = ?", [run_id])
         store.connection.execute("DELETE FROM tasks WHERE run_id = ?", [run_id])
         store.connection.execute("DELETE FROM artifacts WHERE run_id = ?", [run_id])
         store.connection.execute("DELETE FROM runs WHERE run_id = ?", [run_id])
+
+    # Restart the local Quack server now that exclusive access is no longer needed.
+    if effective_db_uri is None and db_uri and db_uri.startswith("quack:") and is_local_quack_uri(db_uri):
+        ensure_local_quack_server(database_path, db_uri)
 
     return {
         "runs_pruned": 1,
@@ -429,6 +452,10 @@ def _delete_run_artifacts(*, artifacts_root: Path, run_id: str) -> None:
 
 
 def _vacuum_database(*, database_path: Path, db_uri: str | None) -> None:
+    # Skip VACUUM over Quack — it's a maintenance operation and not worth the
+    # round-trip.  The local DuckDB file gets vacuumed naturally on next direct open.
+    if db_uri and db_uri.startswith("quack:") and is_local_quack_uri(db_uri):
+        return
     with open_state_store(database_path, db_uri=db_uri) as store:
         store.connection.execute("VACUUM")
 

@@ -183,10 +183,12 @@ class LanceDBRetrievalService:
             )
 
         results.sort(key=lambda item: item["score"], reverse=True)
-        # Build per-collection readiness. A collection is "incompatible" when
-        # documents were indexed with a real embedding backend (not hash-fallback)
-        # but the current query fell back to hash-fallback, so vector scores would
-        # be meaningless. When both sides use hash-fallback, lexical search works fine.
+        # Build per-collection readiness. A collection is "incompatible" when:
+        # (a) documents were indexed with a real embedding backend (not hash-fallback)
+        #     but the current query fell back to hash-fallback, so vector scores would
+        #     be meaningless; OR
+        # (b) documents were indexed with a different embedding model or dimensions
+        #     than what is currently configured — also makes vector scores meaningless.
         col_stats = self.collection_stats(run_id=run_id)
         collection_readiness: dict[str, dict[str, str]] = {}
 
@@ -198,12 +200,11 @@ class LanceDBRetrievalService:
                 try:
                     table = db2.open_table(col)
                     sample_rows = table.to_arrow().to_pylist()[:10]
-                    import json as _json
                     has_real_embeddings = False
                     for r in sample_rows:
                         meta = r.get("metadata_json") or "{}"
                         try:
-                            parsed = _json.loads(meta) if isinstance(meta, str) else meta
+                            parsed = meta if isinstance(meta, dict) else json.loads(meta)
                         except Exception:
                             parsed = {}
                         if parsed.get("embedding_backend", "hash-fallback") != "hash-fallback":
@@ -218,11 +219,44 @@ class LanceDBRetrievalService:
                 else:
                     collection_readiness[col] = {"state": "empty", "search_strategy": "lexical"}
         else:
+            # Real embedding available: also check for model/dimension mismatch per collection.
+            db2 = lancedb.connect(str(self.db_path))
             for col in collection_names:
-                if col_stats.get(col, 0) > 0:
-                    collection_readiness[col] = {"state": "ready", "search_strategy": strategy}
-                else:
+                if col_stats.get(col, 0) == 0:
                     collection_readiness[col] = {"state": "empty", "search_strategy": strategy}
+                    continue
+                stored_model = self._sample_embedding_model_from_table(db2, col)
+                if stored_model is not None and stored_model != self.config.retrieval.embedding_model:
+                    collection_readiness[col] = {"state": "incompatible", "search_strategy": "lexical"}
+                else:
+                    collection_readiness[col] = {"state": "ready", "search_strategy": strategy}
+
+        # Re-run search using per-collection effective strategy so incompatible
+        # collections fall back to lexical instead of using mismatched vectors.
+        effective_results: list[dict[str, object]] = []
+        db3 = lancedb.connect(str(self.db_path))
+        for collection_name in collection_names:
+            readiness = collection_readiness.get(collection_name, {})
+            effective_strategy = readiness.get("search_strategy", strategy)
+            try:
+                table = db3.open_table(collection_name)
+            except Exception:
+                continue
+            all_rows = table.to_arrow().to_pylist()
+            filtered_rows = [row for row in all_rows if run_id is None or self._row_matches_run(row, run_id)]
+            effective_results.extend(
+                self._search_collection(
+                    collection_name=collection_name,
+                    table=table,
+                    rows=filtered_rows,
+                    query=query,
+                    vector=vector,
+                    strategy=effective_strategy,
+                    limit=requested_limit,
+                )
+            )
+
+        effective_results.sort(key=lambda item: item["score"], reverse=True)
         return {
             "enabled": True,
             "query": query,
@@ -230,7 +264,7 @@ class LanceDBRetrievalService:
             "collection": collection,
             "search_strategy": strategy,
             "collection_readiness": collection_readiness,
-            "results": results[:requested_limit],
+            "results": effective_results[:requested_limit],
         }
 
     def collection_stats(self, *, run_id: str | None = None) -> dict[str, int]:
@@ -515,6 +549,24 @@ class LanceDBRetrievalService:
             return json.loads(payload)
         except (TypeError, json.JSONDecodeError):
             return {"raw": payload}
+
+    def _sample_embedding_model_from_table(self, db: object, collection: str) -> str | None:
+        """Read up to 10 sample rows from a collection and return the stored embedding_model, or None."""
+        try:
+            table = db.open_table(collection)  # type: ignore[attr-defined]
+            sample_rows = table.to_arrow().to_pylist()[:10]
+        except Exception:
+            return None
+        for row in sample_rows:
+            meta = row.get("metadata_json") or "{}"
+            try:
+                parsed = meta if isinstance(meta, dict) else json.loads(meta)
+            except Exception:
+                parsed = {}
+            model = parsed.get("embedding_model")
+            if model:
+                return str(model)
+        return None
 
     def _search_strategy_for_backend(self, backend: str) -> str:
         if backend == "hash-fallback":

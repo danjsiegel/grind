@@ -127,6 +127,44 @@ def test_verify_backend_json_output(monkeypatch, capsys) -> None:
     assert payload["probes"][0]["probe_id"] == "github_cli.auth_status"
 
 
+def test_verify_backend_kilo_cli_exits_zero_for_passing_report(monkeypatch, capsys) -> None:
+    report = VerificationReport(
+        backend="kilo_cli",
+        role=None,
+        resolved_identity=ResolvedIdentity(provider="kilo_cli", model="kilo/anthropic/claude-sonnet-4.6"),
+        overall_status=VerificationOverallStatus.PASSED,
+        probes=[
+            ProbeResult(
+                probe_id="kilo_cli.auth_list",
+                backend="kilo_cli",
+                kind=ProbeKind.AUTH,
+                required=True,
+                status=ProbeStatus.PASSED,
+                status_reason="credential sources were listed",
+            )
+        ],
+    )
+
+    monkeypatch.setattr(DefaultBackendVerifier, "verify", lambda self, request: report)
+
+    exit_code = main([
+        "verify-backend",
+        "--backend",
+        "kilo_cli",
+        "--model",
+        "kilo/anthropic/claude-sonnet-4.6",
+        "--json",
+    ])
+
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+
+    assert exit_code == 0
+    assert payload["overall_status"] == "passed"
+    assert payload["backend"] == "kilo_cli"
+    assert payload["probes"][0]["probe_id"] == "kilo_cli.auth_list"
+
+
 def test_init_writes_default_engine_yaml(tmp_path: Path, capsys) -> None:
     exit_code = main(["init", "--cwd", str(tmp_path)])
 
